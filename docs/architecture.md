@@ -2,6 +2,45 @@
 
 Gas Town is a multi-agent workspace manager that coordinates AI coding agents working on software projects. It provides the infrastructure for running swarms of agents, managing their lifecycle, and coordinating their work through mail and issue tracking.
 
+## System Overview
+
+```mermaid
+graph TB
+    subgraph "Gas Town"
+        Overseer["👤 Overseer<br/>(Human Operator)"]
+
+        subgraph Town["Town (~/ai/)"]
+            Mayor["🎩 Mayor<br/>(Global Coordinator)"]
+
+            subgraph Rig1["Rig: wyvern"]
+                W1["👁 Witness"]
+                R1["🔧 Refinery"]
+                P1["🐱 Polecat"]
+                P2["🐱 Polecat"]
+                P3["🐱 Polecat"]
+            end
+
+            subgraph Rig2["Rig: beads"]
+                W2["👁 Witness"]
+                R2["🔧 Refinery"]
+                P4["🐱 Polecat"]
+            end
+        end
+    end
+
+    Overseer --> Mayor
+    Mayor --> W1
+    Mayor --> W2
+    W1 --> P1
+    W1 --> P2
+    W1 --> P3
+    W2 --> P4
+    P1 -.-> R1
+    P2 -.-> R1
+    P3 -.-> R1
+    P4 -.-> R2
+```
+
 ## Core Concepts
 
 ### Town
@@ -50,6 +89,19 @@ Agents communicate via **mail** - JSONL-based inboxes for asynchronous messaging
 - Status reporting (Polecat → Witness → Mayor)
 - Session handoff (Agent → Self for context cycling)
 - Escalation (Witness → Mayor for stuck workers)
+
+```mermaid
+flowchart LR
+    subgraph "Communication Flows"
+        direction LR
+        Mayor -->|"dispatch swarm"| Refinery
+        Refinery -->|"assign work"| Polecat
+        Polecat -->|"done signal"| Witness
+        Witness -->|"swarm complete"| Mayor
+        Witness -->|"escalation"| Mayor
+        Mayor -->|"escalation"| Overseer["👤 Overseer"]
+    end
+```
 
 ### Beads
 
@@ -115,6 +167,38 @@ wyvern/                            # Rig = container (NOT a git clone)
 - Refinery's clone is the authoritative "main branch" view
 - Witness may not need its own clone (just monitors polecat state)
 
+```mermaid
+graph TB
+    subgraph Rig["Rig: wyvern (container, NOT a git clone)"]
+        Config["config.json"]
+        Beads[".beads/"]
+
+        subgraph Polecats["polecats/"]
+            Nux["Nux/<br/>(git clone)"]
+            Toast["Toast/<br/>(git clone)"]
+            Capable["Capable/<br/>(git clone)"]
+        end
+
+        subgraph Refinery["refinery/"]
+            RefRig["rig/<br/>(canonical main)"]
+            RefMail["mail/inbox.jsonl"]
+        end
+
+        subgraph Witness["witness/"]
+            WitMail["mail/inbox.jsonl"]
+            WitState["state.json"]
+        end
+
+        subgraph MayorRig["mayor/"]
+            MayRig["rig/<br/>(git clone)"]
+        end
+    end
+
+    Beads -.->|BEADS_DIR| Nux
+    Beads -.->|BEADS_DIR| Toast
+    Beads -.->|BEADS_DIR| Capable
+```
+
 ### Why Decentralized?
 
 Agents live IN rigs rather than in a central location:
@@ -155,6 +239,18 @@ The Refinery manages the merge queue:
 - **Conflict resolution**: Handle merge conflicts
 - **Quality gate**: Ensure tests pass, code quality maintained
 
+```mermaid
+flowchart LR
+    subgraph "Merge Queue Flow"
+        P1[Polecat 1<br/>branch] --> Q[Merge Queue]
+        P2[Polecat 2<br/>branch] --> Q
+        P3[Polecat 3<br/>branch] --> Q
+        Q --> R{Refinery}
+        R -->|merge| M[main]
+        R -->|conflict| P1
+    end
+```
+
 ### Polecat
 
 Polecats are the workers that do actual implementation:
@@ -167,35 +263,60 @@ Polecats are the workers that do actual implementation:
 
 ### Swarm Dispatch
 
-```
-Mayor                     Refinery                    Polecats
-  │                          │                           │
-  ├─── [dispatch swarm] ────►│                           │
-  │                          ├─── [assign issues] ──────►│
-  │                          │                           │ (work)
-  │                          │◄── [PR ready] ────────────┤
-  │                          │ (review/merge)            │
-  │◄── [swarm complete] ─────┤                           │
+```mermaid
+sequenceDiagram
+    participant O as 👤 Overseer
+    participant M as 🎩 Mayor
+    participant R as 🔧 Refinery
+    participant P as 🐱 Polecats
+
+    O->>M: Start swarm on issues
+    M->>R: Dispatch swarm
+    R->>P: Assign issues
+
+    loop For each polecat
+        P->>P: Work on issue
+        P->>R: PR ready
+        R->>R: Review & merge
+    end
+
+    R->>M: Swarm complete
+    M->>O: Report results
 ```
 
 ### Worker Cleanup (Witness-Owned)
 
-```
-Polecat                   Witness                     Mayor         Overseer
-  │                          │                           │              │
-  │ (completes work)         │                           │              │
-  ├─── [done signal] ───────►│                           │              │
-  │                          │ (capture git state)       │              │
-  │                          │ (assess cleanliness)      │              │
-  │◄── [nudge if dirty] ─────┤                           │              │
-  │ (fixes issues)           │                           │              │
-  ├─── [done signal] ───────►│                           │              │
-  │                          │ (verify clean)            │              │
-  │                          │ (kill session)            │              │
-  │                          │                           │              │
-  │                          │ (if stuck 3x) ───────────►│              │
-  │                          │                           │ (can't fix) ─►│
-  │                          │                           │              │ (human decision)
+```mermaid
+sequenceDiagram
+    participant P as 🐱 Polecat
+    participant W as 👁 Witness
+    participant M as 🎩 Mayor
+    participant O as 👤 Overseer
+
+    P->>P: Complete work
+    P->>W: Done signal
+
+    W->>W: Capture git state
+    W->>W: Assess cleanliness
+
+    alt Git state dirty
+        W->>P: Nudge (fix issues)
+        P->>P: Fix issues
+        P->>W: Done signal (retry)
+    end
+
+    alt Clean after ≤3 tries
+        W->>W: Verify clean
+        W->>P: Kill session
+    else Stuck after 3 tries
+        W->>M: Escalate
+        alt Mayor can fix
+            M->>W: Resolution
+        else Mayor can't fix
+            M->>O: Escalate to human
+            O->>M: Decision
+        end
+    end
 ```
 
 ### Session Cycling (Mail-to-Self)
@@ -208,6 +329,24 @@ When an agent's context fills, it hands off to its next session:
 4. **Send**: Mail handoff to own inbox
 5. **Exit**: End session cleanly
 6. **Resume**: New session reads handoff, picks up where old session left off
+
+```mermaid
+sequenceDiagram
+    participant S1 as Agent Session 1
+    participant MB as 📬 Mailbox
+    participant S2 as Agent Session 2
+
+    S1->>S1: Context filling up
+    S1->>S1: Capture current state
+    S1->>MB: Send handoff note
+    S1->>S1: Exit cleanly
+
+    Note over S1,S2: Session boundary
+
+    S2->>MB: Check inbox
+    MB->>S2: Handoff note
+    S2->>S2: Resume from handoff state
+```
 
 ## Key Design Decisions
 
