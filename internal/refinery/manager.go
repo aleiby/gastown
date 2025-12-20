@@ -134,22 +134,17 @@ func (m *Manager) Start(foreground bool) error {
 		return err
 	}
 
-	// Check if already running via tmux session
 	t := tmux.NewTmux()
 	sessionID := m.sessionName()
-	running, _ := t.HasSession(sessionID)
-	if running {
-		return ErrAlreadyRunning
-	}
-
-	// Also check via PID for backwards compatibility
-	if ref.State == StateRunning && ref.PID > 0 && processExists(ref.PID) {
-		return ErrAlreadyRunning
-	}
 
 	if foreground {
+		// In foreground mode, we're likely running inside the tmux session
+		// that background mode created. Only check PID to avoid self-detection.
+		if ref.State == StateRunning && ref.PID > 0 && processExists(ref.PID) {
+			return ErrAlreadyRunning
+		}
+
 		// Running in foreground - update state and run the Go-based polling loop
-		// This is the legacy mode, kept for backwards compatibility
 		now := time.Now()
 		ref.State = StateRunning
 		ref.StartedAt = &now
@@ -161,6 +156,17 @@ func (m *Manager) Start(foreground bool) error {
 
 		// Run the processing loop (blocking)
 		return m.run(ref)
+	}
+
+	// Background mode: check if session already exists
+	running, _ := t.HasSession(sessionID)
+	if running {
+		return ErrAlreadyRunning
+	}
+
+	// Also check via PID for backwards compatibility
+	if ref.State == StateRunning && ref.PID > 0 && processExists(ref.PID) {
+		return ErrAlreadyRunning
 	}
 
 	// Background mode: spawn a Claude agent in a tmux session
