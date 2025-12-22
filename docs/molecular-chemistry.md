@@ -37,8 +37,8 @@ Work in Gas Town exists in three phases, following the states of matter:
 
 ### Proto (Solid Phase)
 
-Protos are **frozen workflow patterns** - crystallized templates that encode
-reusable work structures. They're the "molds" from which instances are cast.
+Protos or protomolecules are **frozen workflow patterns** - crystallized templates that
+encode reusable work structures. They're the "molds" from which instances are cast.
 
 ```markdown
 ## Molecule: engineer-in-box
@@ -52,9 +52,13 @@ Needs: (none)
 Write the code.
 Needs: design
 
+## Step: review
+Perform initial code review.
+Needs: implement
+
 ## Step: test
 Write and run tests.
-Needs: implement
+Needs: review
 
 ## Step: submit
 Submit for merge.
@@ -62,10 +66,11 @@ Needs: test
 ```
 
 **Properties:**
-- Immutable once defined (frozen)
-- Named (e.g., `mol-engineer-in-box`, `mol-code-review`)
+- Considered immutable once defined (frozen), though editable
+- Named (e.g., `mol-engineer-in-box`, `wisp-deacon-patrol`)
+  - Can have any name, but convention says how they will materialize.
 - Stored in permanent beads with `template` label
-- Can be composed into larger protos (polymers)
+- Can be composed into larger protos (compounds, polymers)
 
 ### Mol (Liquid Phase)
 

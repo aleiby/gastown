@@ -460,10 +460,13 @@ func outputStartupDirective(ctx RoleContext) {
 		fmt.Println("**STARTUP PROTOCOL**: You are the Deacon. Please:")
 		fmt.Println("1. Announce: \"Deacon, checking in.\"")
 		fmt.Println("2. Signal awake: `gt deacon heartbeat \"starting patrol\"`")
-		fmt.Println("3. Check for attached patrol: `bd list --status=in_progress --assignee=deacon`")
-		fmt.Println("4. If attached: resume from current step")
-		fmt.Println("5. If naked: `gt mol bond mol-deacon-patrol`")
+		fmt.Println("3. cd to rig: `cd gastown/mayor/rig`")
+		fmt.Println("4. Check Patrol Status above - if attached, resume from current step")
+		fmt.Println("5. If naked, start wisp patrol:")
+		fmt.Println("   - Find proto ID: `bd mol list` (look for mol-deacon-patrol)")
+		fmt.Println("   - Spawn: `bd --no-daemon mol spawn <proto-id>`")
 		fmt.Println("6. Execute patrol steps until loop-or-exit")
+		fmt.Println("7. At cycle end: `bd --no-daemon mol squash <mol-id> --summary \"<cycle summary>\"`")
 	}
 }
 
@@ -609,70 +612,86 @@ func showMoleculeProgress(b *beads.Beads, rootID string) {
 }
 
 // outputDeaconPatrolContext shows patrol molecule status for the Deacon.
+// Deacon uses wisps (Wisp:true issues in main .beads/) for patrol cycles.
+// Spawn creates wisp-marked issues that are auto-deleted on squash.
 func outputDeaconPatrolContext(ctx RoleContext) {
-	b := beads.New(ctx.TownRoot)
-
-	// Check for in-progress patrol steps assigned to deacon
-	issues, err := b.List(beads.ListOptions{
-		Status:   "in_progress",
-		Assignee: "deacon",
-		Priority: -1,
-	})
-	if err != nil {
-		// Silently skip if beads lookup fails
-		return
-	}
-
 	fmt.Println()
-	fmt.Printf("%s\n\n", style.Bold.Render("## 🔄 Patrol Status"))
+	fmt.Printf("%s\n\n", style.Bold.Render("## 🔄 Patrol Status (Wisp-based)"))
 
-	if len(issues) == 0 {
-		// No attached molecule - show "naked" status
+	// Check for active mol-deacon-patrol molecules in rig beads
+	// A patrol is "active" if it has open wisp children (steps to execute)
+	// After squash, the root stays open but has no open children - that's "completed"
+	rigBeadsDir := filepath.Join(ctx.TownRoot, "gastown", "mayor", "rig")
+
+	// First find mol-deacon-patrol molecules (exclude template)
+	cmdList := exec.Command("bd", "list", "--status=open", "--type=epic")
+	cmdList.Dir = rigBeadsDir
+	var stdoutList bytes.Buffer
+	cmdList.Stdout = &stdoutList
+	cmdList.Stderr = nil
+	errList := cmdList.Run()
+
+	// Find a patrol molecule with open children
+	hasPatrol := false
+	var patrolLine string
+	var patrolID string
+	if errList == nil {
+		lines := strings.Split(stdoutList.String(), "\n")
+		for _, line := range lines {
+			if strings.Contains(line, "mol-deacon-patrol") && !strings.Contains(line, "[template]") {
+				// Extract the ID (first word)
+				parts := strings.Fields(line)
+				if len(parts) > 0 {
+					molID := parts[0]
+					// Check if this molecule has open children using bd show
+					cmdShow := exec.Command("bd", "show", molID)
+					cmdShow.Dir = rigBeadsDir
+					var stdoutShow bytes.Buffer
+					cmdShow.Stdout = &stdoutShow
+					cmdShow.Stderr = nil
+					if cmdShow.Run() == nil {
+						showOutput := stdoutShow.String()
+						// Check for "- open]" in children section (open child steps)
+						if strings.Contains(showOutput, "- open]") {
+							hasPatrol = true
+							patrolLine = line
+							patrolID = molID
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+	_ = patrolID // Silence unused warning
+
+	if !hasPatrol {
+		// No attached patrol - show "naked" status
 		fmt.Println("Status: **Naked** (no patrol molecule attached)")
 		fmt.Println()
-		fmt.Println("To start patrol:")
-		fmt.Println("  gt mol bond mol-deacon-patrol")
+		fmt.Println("To start patrol cycle:")
+		fmt.Println("  cd gastown/mayor/rig")
+		fmt.Println("  bd mol list                        # Find mol-deacon-patrol proto ID")
+		fmt.Println("  bd --no-daemon mol spawn <id>      # e.g., bd --no-daemon mol spawn gt-iep9")
 		return
 	}
 
-	// Find the patrol molecule step we're working on
-	for _, issue := range issues {
-		// Check if this is a patrol molecule step
-		moleculeID := parseMoleculeMetadata(issue.Description)
-		if moleculeID == "" {
-			continue
-		}
-
-		// Get the parent (root) issue ID
-		rootID := issue.Parent
-		if rootID == "" {
-			continue
-		}
-
-		// This is a molecule step - show context
-		fmt.Println("Status: **Attached** (patrol molecule in progress)")
-		fmt.Printf("  Current step: %s\n", issue.ID)
-		fmt.Printf("  Molecule: %s\n", moleculeID)
-		fmt.Printf("  Root issue: %s\n\n", rootID)
-
-		// Show patrol progress
-		showMoleculeProgress(b, rootID)
-
-		fmt.Println()
-		fmt.Println("**Patrol Work Loop:**")
-		fmt.Println("1. Execute current step: " + issue.Title)
-		fmt.Println("2. Close step: `bd close " + issue.ID + "`")
-		fmt.Println("3. Check next: `bd ready --parent " + rootID + "`")
-		fmt.Println("4. On final step (loop-or-exit): burn and loop or exit")
-		return
-	}
-
-	// Has issues but none are molecule steps - might be orphaned work
-	fmt.Println("Status: **In-progress work** (not a patrol molecule)")
+	// Has patrol - show attached status
+	fmt.Println("Status: **Attached** (wisp patrol in progress)")
 	fmt.Println()
-	fmt.Println("To start fresh patrol:")
-	fmt.Println("  bd close <in-progress-issues>")
-	fmt.Println("  gt mol bond mol-deacon-patrol")
+	// Show the patrol molecule details
+	fmt.Printf("Active patrol: %s\n\n", strings.TrimSpace(patrolLine))
+
+	fmt.Println("**Wisp Patrol Work Loop:**")
+	fmt.Println("Run from gastown/mayor/rig/:")
+	fmt.Println("1. Check next step: `bd ready`")
+	fmt.Println("2. Execute the step (heartbeat, mail, health checks, etc.)")
+	fmt.Println("3. Close step: `bd close <step-id>`")
+	fmt.Println("4. Check next: `bd ready`")
+	fmt.Println("5. At cycle end (loop-or-exit step):")
+	fmt.Println("   - Generate summary of patrol cycle")
+	fmt.Println("   - Squash: `bd --no-daemon mol squash <mol-id> --summary \"<summary>\"`")
+	fmt.Println("   - Loop back to spawn new wisp, or exit if context high")
 }
 
 // acquireIdentityLock checks and acquires the identity lock for worker roles.

@@ -13,7 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/git"
@@ -131,13 +130,11 @@ func (d *Daemon) heartbeat(state *State) {
 	// 1. Ensure Deacon is running (the Deacon is the heartbeat of the system)
 	d.ensureDeaconRunning()
 
-	// 2. Check Deacon attachment - spawn patrol if naked
-	d.checkDeaconAttachment()
-
-	// 3. Poke Deacon - the Deacon monitors Mayor and Witnesses
+	// 2. Poke Deacon - the Deacon monitors Mayor and Witnesses
+	// Note: Deacon self-spawns wisps for patrol cycles (no daemon attachment needed)
 	d.pokeDeacon()
 
-	// 4. Process lifecycle requests
+	// 3. Process lifecycle requests
 	d.processLifecycleRequests()
 
 	// Update state
@@ -155,9 +152,6 @@ const DeaconSessionName = "gt-deacon"
 
 // DeaconRole is the role name for the Deacon's handoff bead.
 const DeaconRole = "deacon"
-
-// DeaconPatrolMolecule is the well-known ID for the deacon patrol molecule.
-const DeaconPatrolMolecule = "mol-deacon-patrol"
 
 // deaconMOTDMessages contains rotating motivational and educational tips
 // for the Deacon heartbeat. These make the thankless patrol role more fun.
@@ -225,118 +219,6 @@ func (d *Daemon) ensureDeaconRunning() {
 	}
 
 	d.logger.Println("Deacon session started successfully")
-}
-
-// checkDeaconAttachment checks if the Deacon's pinned bead has an attached molecule.
-// If the Deacon is "naked" (no attachment), this spawns mol-deacon-patrol and
-// attaches it to drive the Deacon's patrol loop.
-func (d *Daemon) checkDeaconAttachment() {
-	// Get beads client for the town root
-	bd := beads.New(d.config.TownRoot)
-
-	// Find or create the Deacon's handoff bead
-	pinnedBead, err := bd.GetOrCreateHandoffBead(DeaconRole)
-	if err != nil {
-		d.logger.Printf("Error getting Deacon handoff bead: %v", err)
-		return
-	}
-
-	// Check if the Deacon is naked (no attached molecule)
-	attachment := beads.ParseAttachmentFields(pinnedBead)
-	if attachment != nil && attachment.AttachedMolecule != "" {
-		d.logger.Printf("Deacon has attachment: %s", attachment.AttachedMolecule)
-		return
-	}
-
-	// Deacon is naked - need to attach mol-deacon-patrol
-	d.logger.Println("Deacon is naked (no attached molecule), spawning patrol...")
-
-	// Find the mol-deacon-patrol template
-	molTemplate, err := d.findDeaconPatrolMolecule(bd)
-	if err != nil {
-		d.logger.Printf("Error finding deacon patrol molecule: %v", err)
-		return
-	}
-
-	// Instantiate the patrol molecule with the Deacon's pinned bead as parent
-	steps, err := bd.InstantiateMolecule(molTemplate, pinnedBead, beads.InstantiateOptions{})
-	if err != nil {
-		d.logger.Printf("Error instantiating deacon patrol: %v", err)
-		return
-	}
-	d.logger.Printf("Instantiated mol-deacon-patrol with %d steps", len(steps))
-
-	// Attach the molecule to the Deacon's pinned bead
-	if _, err := bd.AttachMolecule(pinnedBead.ID, molTemplate.ID); err != nil {
-		d.logger.Printf("Error attaching molecule: %v", err)
-		return
-	}
-	d.logger.Printf("Attached %s to Deacon's pinned bead", molTemplate.ID)
-
-	// Nudge the Deacon to start the patrol
-	d.nudgeDeaconForPatrol()
-}
-
-// findDeaconPatrolMolecule finds the mol-deacon-patrol template issue.
-// It first looks for an existing molecule, then falls back to creating from builtin.
-func (d *Daemon) findDeaconPatrolMolecule(bd *beads.Beads) (*beads.Issue, error) {
-	// Look for existing molecule by title
-	molecules, err := bd.List(beads.ListOptions{Type: "molecule", Priority: -1})
-	if err != nil {
-		return nil, fmt.Errorf("listing molecules: %w", err)
-	}
-
-	// Find "Deacon Patrol" molecule
-	for _, mol := range molecules {
-		if mol.Title == "Deacon Patrol" {
-			return mol, nil
-		}
-	}
-
-	// Not found - seed builtin molecules and try again
-	d.logger.Println("Deacon Patrol molecule not found, seeding builtins...")
-	created, err := bd.SeedBuiltinMolecules()
-	if err != nil {
-		return nil, fmt.Errorf("seeding builtin molecules: %w", err)
-	}
-	d.logger.Printf("Seeded %d builtin molecules", created)
-
-	// Try again
-	molecules, err = bd.List(beads.ListOptions{Type: "molecule", Priority: -1})
-	if err != nil {
-		return nil, fmt.Errorf("listing molecules after seed: %w", err)
-	}
-
-	for _, mol := range molecules {
-		if mol.Title == "Deacon Patrol" {
-			return mol, nil
-		}
-	}
-
-	return nil, fmt.Errorf("Deacon Patrol molecule not found after seeding")
-}
-
-// nudgeDeaconForPatrol sends a message to the Deacon to start its patrol loop.
-func (d *Daemon) nudgeDeaconForPatrol() {
-	running, err := d.tmux.HasSession(DeaconSessionName)
-	if err != nil {
-		d.logger.Printf("Error checking Deacon session for nudge: %v", err)
-		return
-	}
-
-	if !running {
-		d.logger.Println("Deacon session not running, cannot nudge")
-		return
-	}
-
-	// Send patrol start message
-	msg := "PATROL: mol-deacon-patrol attached. Start your patrol loop."
-	if err := d.tmux.SendKeysReplace(DeaconSessionName, msg, 50); err != nil {
-		d.logger.Printf("Error nudging Deacon for patrol: %v", err)
-		return
-	}
-
-	d.logger.Println("Nudged Deacon to start patrol")
 }
 
 // pokeDeacon sends a heartbeat message to the Deacon session.
