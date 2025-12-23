@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -194,7 +195,28 @@ var (
 	polecatSyncAll      bool
 	polecatSyncFromMain bool
 	polecatStatusJSON   bool
+	polecatGitStateJSON bool
 )
+
+var polecatGitStateCmd = &cobra.Command{
+	Use:   "git-state <rig>/<polecat>",
+	Short: "Show git state for pre-kill verification",
+	Long: `Show git state for a polecat's worktree.
+
+Used by the Witness for pre-kill verification to ensure no work is lost.
+Returns whether the worktree is clean (safe to kill) or dirty (needs cleanup).
+
+Checks:
+  - Working tree: uncommitted changes
+  - Unpushed commits: commits ahead of origin/main
+  - Stashes: stashed changes
+
+Examples:
+  gt polecat git-state gastown/Toast
+  gt polecat git-state gastown/Toast --json`,
+	Args: cobra.ExactArgs(1),
+	RunE: runPolecatGitState,
+}
 
 func init() {
 	// List flags
@@ -212,6 +234,9 @@ func init() {
 	// Status flags
 	polecatStatusCmd.Flags().BoolVar(&polecatStatusJSON, "json", false, "Output as JSON")
 
+	// Git-state flags
+	polecatGitStateCmd.Flags().BoolVar(&polecatGitStateJSON, "json", false, "Output as JSON")
+
 	// Add subcommands
 	polecatCmd.AddCommand(polecatListCmd)
 	polecatCmd.AddCommand(polecatAddCmd)
@@ -222,6 +247,7 @@ func init() {
 	polecatCmd.AddCommand(polecatResetCmd)
 	polecatCmd.AddCommand(polecatSyncCmd)
 	polecatCmd.AddCommand(polecatStatusCmd)
+	polecatCmd.AddCommand(polecatGitStateCmd)
 
 	rootCmd.AddCommand(polecatCmd)
 }
@@ -814,4 +840,175 @@ func formatActivityTime(t time.Time) string {
 	default:
 		return fmt.Sprintf("%d days ago", int(d.Hours()/24))
 	}
+}
+
+// GitState represents the git state of a polecat's worktree.
+type GitState struct {
+	Clean            bool     `json:"clean"`
+	UncommittedFiles []string `json:"uncommitted_files"`
+	UnpushedCommits  int      `json:"unpushed_commits"`
+	StashCount       int      `json:"stash_count"`
+}
+
+func runPolecatGitState(cmd *cobra.Command, args []string) error {
+	rigName, polecatName, err := parseAddress(args[0])
+	if err != nil {
+		return err
+	}
+
+	mgr, r, err := getPolecatManager(rigName)
+	if err != nil {
+		return err
+	}
+
+	// Verify polecat exists
+	p, err := mgr.Get(polecatName)
+	if err != nil {
+		return fmt.Errorf("polecat '%s' not found in rig '%s'", polecatName, rigName)
+	}
+
+	// Get git state from the polecat's worktree
+	state, err := getGitState(p.ClonePath)
+	if err != nil {
+		return fmt.Errorf("getting git state: %w", err)
+	}
+
+	// JSON output
+	if polecatGitStateJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(state)
+	}
+
+	// Human-readable output
+	fmt.Printf("%s\n\n", style.Bold.Render(fmt.Sprintf("Git State: %s/%s", r.Name, polecatName)))
+
+	// Working tree status
+	if len(state.UncommittedFiles) == 0 {
+		fmt.Printf("  Working Tree:  %s\n", style.Success.Render("clean"))
+	} else {
+		fmt.Printf("  Working Tree:  %s\n", style.Warning.Render("dirty"))
+		fmt.Printf("  Uncommitted:   %s\n", style.Warning.Render(fmt.Sprintf("%d files", len(state.UncommittedFiles))))
+		for _, f := range state.UncommittedFiles {
+			fmt.Printf("                 %s\n", style.Dim.Render(f))
+		}
+	}
+
+	// Unpushed commits
+	if state.UnpushedCommits == 0 {
+		fmt.Printf("  Unpushed:      %s\n", style.Success.Render("0 commits"))
+	} else {
+		fmt.Printf("  Unpushed:      %s\n", style.Warning.Render(fmt.Sprintf("%d commits ahead", state.UnpushedCommits)))
+	}
+
+	// Stashes
+	if state.StashCount == 0 {
+		fmt.Printf("  Stashes:       %s\n", style.Dim.Render("0"))
+	} else {
+		fmt.Printf("  Stashes:       %s\n", style.Warning.Render(fmt.Sprintf("%d", state.StashCount)))
+	}
+
+	// Verdict
+	fmt.Println()
+	if state.Clean {
+		fmt.Printf("  Verdict:       %s\n", style.Success.Render("CLEAN (safe to kill)"))
+	} else {
+		fmt.Printf("  Verdict:       %s\n", style.Error.Render("DIRTY (needs cleanup)"))
+	}
+
+	return nil
+}
+
+// getGitState checks the git state of a worktree.
+func getGitState(worktreePath string) (*GitState, error) {
+	state := &GitState{
+		Clean:            true,
+		UncommittedFiles: []string{},
+	}
+
+	// Check for uncommitted changes (git status --porcelain)
+	statusCmd := exec.Command("git", "status", "--porcelain")
+	statusCmd.Dir = worktreePath
+	output, err := statusCmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("git status: %w", err)
+	}
+	if len(output) > 0 {
+		lines := splitLines(string(output))
+		for _, line := range lines {
+			if line != "" {
+				// Extract filename (skip the status prefix)
+				if len(line) > 3 {
+					state.UncommittedFiles = append(state.UncommittedFiles, line[3:])
+				} else {
+					state.UncommittedFiles = append(state.UncommittedFiles, line)
+				}
+			}
+		}
+		state.Clean = false
+	}
+
+	// Check for unpushed commits (git log origin/main..HEAD)
+	logCmd := exec.Command("git", "log", "origin/main..HEAD", "--oneline")
+	logCmd.Dir = worktreePath
+	output, err = logCmd.Output()
+	if err != nil {
+		// origin/main might not exist - try origin/master
+		logCmd = exec.Command("git", "log", "origin/master..HEAD", "--oneline")
+		logCmd.Dir = worktreePath
+		output, _ = logCmd.Output() // Ignore error - might be a new repo
+	}
+	if len(output) > 0 {
+		lines := splitLines(string(output))
+		count := 0
+		for _, line := range lines {
+			if line != "" {
+				count++
+			}
+		}
+		state.UnpushedCommits = count
+		if count > 0 {
+			state.Clean = false
+		}
+	}
+
+	// Check for stashes (git stash list)
+	stashCmd := exec.Command("git", "stash", "list")
+	stashCmd.Dir = worktreePath
+	output, err = stashCmd.Output()
+	if err != nil {
+		// Ignore stash errors
+		output = nil
+	}
+	if len(output) > 0 {
+		lines := splitLines(string(output))
+		count := 0
+		for _, line := range lines {
+			if line != "" {
+				count++
+			}
+		}
+		state.StashCount = count
+		if count > 0 {
+			state.Clean = false
+		}
+	}
+
+	return state, nil
+}
+
+// splitLines splits a string into non-empty lines.
+func splitLines(s string) []string {
+	var lines []string
+	for _, line := range filepath.SplitList(s) {
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	// filepath.SplitList doesn't work for newlines, use strings.Split instead
+	lines = nil
+	for _, line := range strings.Split(s, "\n") {
+		lines = append(lines, line)
+	}
+	return lines
 }
