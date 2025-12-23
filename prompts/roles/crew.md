@@ -142,6 +142,51 @@ Without beads, track your work through:
 - Direct communication with the overseer
 {{ /unless }}
 
+## Session Wisp Model (Autonomous Work)
+
+Crew workers use a **session wisp** pattern for long-running molecules:
+
+### The Auto-Continue Pattern
+
+When you start a session:
+1. Check for attached work: `gt mol status`
+2. **If attachment found** → Continue immediately (no human input needed)
+3. **If no attachment** → Await user instruction
+
+This enables **overnight autonomous work** on long molecules.
+
+### Working on Attached Molecules
+
+```bash
+# Check what's attached
+gt mol status
+
+# Find next ready step in the attached work
+bd ready --parent=<work-mol-root>
+
+# Work the step
+bd update <step> --status=in_progress
+# ... do the work ...
+bd close <step>
+```
+
+### Attaching Work (for the overseer)
+
+To enable autonomous work, attach a molecule:
+
+```bash
+# Find or create a work issue
+bd create --type=epic --title="Long feature work"
+
+# Pin it to the crew worker
+bd update <issue-id> --assignee={{ rig }}/crew/{{ name }} --pinned
+
+# Attach the molecule
+gt mol attach <issue-id> mol-engineer-in-box
+```
+
+Now the crew worker will continue this work across sessions.
+
 ## Session End Checklist
 
 Before ending your session:
@@ -152,7 +197,7 @@ Before ending your session:
 [ ] 3. bd sync                 (sync beads if configured)
 [ ] 4. Check inbox             (any messages needing response?)
 [ ] 5. HANDOFF if incomplete:
-        gt mail send {{ rig }}/{{ name }} -s "HANDOFF: ..." -m "..."
+        gt mail send {{ rig }}/{{ name }} -s "🤝 HANDOFF: ..." -m "..."
 ```
 
 ## Tips

@@ -92,6 +92,9 @@ func runPrime(cmd *cobra.Command, args []string) error {
 	// Output handoff content if present
 	outputHandoffContent(ctx)
 
+	// Output crew attachment status (for autonomous work detection)
+	outputCrewAttachmentStatus(ctx)
+
 	// Output molecule context if working on a molecule step
 	outputMoleculeContext(ctx)
 
@@ -452,7 +455,9 @@ func outputStartupDirective(ctx RoleContext) {
 		fmt.Printf("1. Announce: \"%s Crew %s, checking in.\"\n", ctx.Rig, ctx.Polecat)
 		fmt.Println("2. Check mail: `gt mail inbox`")
 		fmt.Println("3. If there's a 🤝 HANDOFF message, read it and continue the work")
-		fmt.Println("4. If no mail, await user instruction")
+		fmt.Println("4. Check for attached work: `gt mol status`")
+		fmt.Println("   - If attachment found → **AUTO-CONTINUE** (no human input needed)")
+		fmt.Println("   - If no attachment → await user instruction")
 	case RoleDeacon:
 		fmt.Println()
 		fmt.Println("---")
@@ -490,6 +495,50 @@ func runMailCheckInject(workDir string) {
 		fmt.Println()
 		fmt.Println(output)
 	}
+}
+
+// outputCrewAttachmentStatus checks for attached work molecule and outputs status.
+// This is key for the autonomous overnight work pattern.
+func outputCrewAttachmentStatus(ctx RoleContext) {
+	if ctx.Role != RoleCrew {
+		return
+	}
+
+	// Check for pinned beads with attachments
+	b := beads.New(ctx.WorkDir)
+
+	// Build assignee string for crew worker
+	assignee := fmt.Sprintf("%s/crew/%s", ctx.Rig, ctx.Polecat)
+
+	// Find pinned beads for this agent
+	pinnedBeads, err := b.List(beads.ListOptions{
+		Status:   beads.StatusPinned,
+		Assignee: assignee,
+		Priority: -1,
+	})
+	if err != nil || len(pinnedBeads) == 0 {
+		// No pinned beads - interactive mode
+		return
+	}
+
+	// Check first pinned bead for attachment
+	attachment := beads.ParseAttachmentFields(pinnedBeads[0])
+	if attachment == nil || attachment.AttachedMolecule == "" {
+		// No attachment - interactive mode
+		return
+	}
+
+	// Has attached work - output prominently
+	fmt.Println()
+	fmt.Printf("%s\n\n", style.Bold.Render("## 🎯 ATTACHED WORK DETECTED"))
+	fmt.Printf("Pinned bead: %s\n", pinnedBeads[0].ID)
+	fmt.Printf("Attached molecule: %s\n", attachment.AttachedMolecule)
+	if attachment.AttachedAt != "" {
+		fmt.Printf("Attached at: %s\n", attachment.AttachedAt)
+	}
+	fmt.Println()
+	fmt.Println(style.Bold.Render("→ AUTO-CONTINUE MODE: Proceed with attached work immediately."))
+	fmt.Println("  No human input needed. Continue from where predecessor left off.")
 }
 
 // outputMoleculeContext checks if the agent is working on a molecule step and shows progress.
