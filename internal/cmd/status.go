@@ -54,6 +54,8 @@ type AgentRuntime struct {
 	Running   bool   `json:"running"`    // Is tmux session running?
 	HasWork   bool   `json:"has_work"`   // Has pinned work?
 	WorkTitle string `json:"work_title,omitempty"` // Title of pinned work
+	HookBead  string `json:"hook_bead,omitempty"`  // Pinned bead ID from agent bead
+	State     string `json:"state,omitempty"`      // Agent state from agent bead
 }
 
 // RigStatus represents status of a single rig.
@@ -124,11 +126,15 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("discovering rigs: %w", err)
 	}
 
+	// Create beads instance for agent bead lookups (gastown rig holds gt- prefix beads)
+	gastownBeadsPath := filepath.Join(townRoot, "gastown", "mayor", "rig")
+	agentBeads := beads.New(gastownBeadsPath)
+
 	// Build status
 	status := TownStatus{
 		Name:     townConfig.Name,
 		Location: townRoot,
-		Agents:   discoverGlobalAgents(t),
+		Agents:   discoverGlobalAgents(t, agentBeads),
 		Rigs:     make([]RigStatus, 0, len(rigs)),
 	}
 
@@ -160,7 +166,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		}
 
 		// Discover runtime state for all agents in this rig
-		rs.Agents = discoverRigAgents(t, r, rs.Crews)
+		rs.Agents = discoverRigAgents(t, r, rs.Crews, agentBeads)
 
 		status.Rigs = append(status.Rigs, rs)
 
@@ -201,7 +207,27 @@ func outputStatusText(status TownStatus) error {
 		if !agent.Running {
 			statusStr = style.Error.Render("✗ stopped")
 		}
-		fmt.Printf("   %-14s %s\n", agent.Name, statusStr)
+
+		// Show hook bead and state from agent bead
+		hookInfo := ""
+		if agent.HookBead != "" {
+			hookInfo = fmt.Sprintf(" → %s", agent.HookBead)
+			if agent.WorkTitle != "" {
+				// Truncate title if too long
+				title := agent.WorkTitle
+				if len(title) > 30 {
+					title = title[:27] + "..."
+				}
+				hookInfo = fmt.Sprintf(" → %s (%s)", agent.HookBead, title)
+			}
+		}
+
+		stateInfo := ""
+		if agent.State != "" && agent.State != "idle" {
+			stateInfo = fmt.Sprintf(" [%s]", agent.State)
+		}
+
+		fmt.Printf("   %-14s %s%s%s\n", agent.Name, statusStr, hookInfo, stateInfo)
 	}
 
 	if len(status.Rigs) == 0 {
@@ -221,19 +247,36 @@ func outputStatusText(status TownStatus) error {
 				statusStr = style.Error.Render("✗ stopped")
 			}
 
-			// Find hook info for this agent
+			// Show hook bead from agent bead (preferred), fall back to Hooks array
 			hookInfo := ""
-			for _, h := range r.Hooks {
-				if h.Agent == agent.Address && h.HasWork {
-					if h.Molecule != "" {
-						hookInfo = fmt.Sprintf(" → %s", h.Molecule)
-					} else if h.Title != "" {
-						hookInfo = fmt.Sprintf(" → %s", h.Title)
-					} else {
-						hookInfo = " → (work attached)"
+			if agent.HookBead != "" {
+				hookInfo = fmt.Sprintf(" → %s", agent.HookBead)
+				if agent.WorkTitle != "" {
+					title := agent.WorkTitle
+					if len(title) > 25 {
+						title = title[:22] + "..."
 					}
-					break
+					hookInfo = fmt.Sprintf(" → %s (%s)", agent.HookBead, title)
 				}
+			} else {
+				// Fall back to legacy Hooks array
+				for _, h := range r.Hooks {
+					if h.Agent == agent.Address && h.HasWork {
+						if h.Molecule != "" {
+							hookInfo = fmt.Sprintf(" → %s", h.Molecule)
+						} else if h.Title != "" {
+							hookInfo = fmt.Sprintf(" → %s", h.Title)
+						} else {
+							hookInfo = " → (work attached)"
+						}
+						break
+					}
+				}
+			}
+
+			stateInfo := ""
+			if agent.State != "" && agent.State != "idle" {
+				stateInfo = fmt.Sprintf(" [%s]", agent.State)
 			}
 
 			// Format agent name based on role
@@ -242,7 +285,7 @@ func outputStatusText(status TownStatus) error {
 				displayName = "crew/" + agent.Name
 			}
 
-			fmt.Printf("      %-14s %s%s\n", displayName, statusStr, hookInfo)
+			fmt.Printf("      %-14s %s%s%s\n", displayName, statusStr, hookInfo, stateInfo)
 		}
 
 		// Show polecats if any (these are already in r.Agents if discovered)
@@ -290,86 +333,163 @@ func discoverRigHooks(r *rig.Rig, crews []string) []AgentHookInfo {
 }
 
 // discoverGlobalAgents checks runtime state for town-level agents (Mayor, Deacon).
-func discoverGlobalAgents(t *tmux.Tmux) []AgentRuntime {
+func discoverGlobalAgents(t *tmux.Tmux, agentBeads *beads.Beads) []AgentRuntime {
 	var agents []AgentRuntime
 
 	// Check Mayor
 	mayorRunning, _ := t.HasSession(MayorSessionName)
-	agents = append(agents, AgentRuntime{
+	mayor := AgentRuntime{
 		Name:    "mayor",
 		Address: "mayor",
 		Session: MayorSessionName,
 		Role:    "coordinator",
 		Running: mayorRunning,
-	})
+	}
+	// Look up agent bead for hook/state
+	if issue, fields, err := agentBeads.GetAgentBead("gt-mayor"); err == nil && issue != nil {
+		mayor.HookBead = fields.HookBead
+		mayor.State = fields.AgentState
+		if fields.HookBead != "" {
+			mayor.HasWork = true
+			// Try to get the title of the pinned bead
+			if pinnedIssue, err := agentBeads.Show(fields.HookBead); err == nil {
+				mayor.WorkTitle = pinnedIssue.Title
+			}
+		}
+	}
+	agents = append(agents, mayor)
 
 	// Check Deacon
 	deaconRunning, _ := t.HasSession(DeaconSessionName)
-	agents = append(agents, AgentRuntime{
+	deacon := AgentRuntime{
 		Name:    "deacon",
 		Address: "deacon",
 		Session: DeaconSessionName,
 		Role:    "health-check",
 		Running: deaconRunning,
-	})
+	}
+	// Look up agent bead for hook/state
+	if issue, fields, err := agentBeads.GetAgentBead("gt-deacon"); err == nil && issue != nil {
+		deacon.HookBead = fields.HookBead
+		deacon.State = fields.AgentState
+		if fields.HookBead != "" {
+			deacon.HasWork = true
+			if pinnedIssue, err := agentBeads.Show(fields.HookBead); err == nil {
+				deacon.WorkTitle = pinnedIssue.Title
+			}
+		}
+	}
+	agents = append(agents, deacon)
 
 	return agents
 }
 
 // discoverRigAgents checks runtime state for all agents in a rig.
-func discoverRigAgents(t *tmux.Tmux, r *rig.Rig, crews []string) []AgentRuntime {
+func discoverRigAgents(t *tmux.Tmux, r *rig.Rig, crews []string, agentBeads *beads.Beads) []AgentRuntime {
 	var agents []AgentRuntime
 
 	// Check Witness
 	if r.HasWitness {
 		sessionName := witnessSessionName(r.Name)
 		running, _ := t.HasSession(sessionName)
-		agents = append(agents, AgentRuntime{
+		witness := AgentRuntime{
 			Name:    "witness",
 			Address: r.Name + "/witness",
 			Session: sessionName,
 			Role:    "witness",
 			Running: running,
-		})
+		}
+		// Look up agent bead
+		agentID := fmt.Sprintf("gt-witness-%s", r.Name)
+		if issue, fields, err := agentBeads.GetAgentBead(agentID); err == nil && issue != nil {
+			witness.HookBead = fields.HookBead
+			witness.State = fields.AgentState
+			if fields.HookBead != "" {
+				witness.HasWork = true
+				if pinnedIssue, err := agentBeads.Show(fields.HookBead); err == nil {
+					witness.WorkTitle = pinnedIssue.Title
+				}
+			}
+		}
+		agents = append(agents, witness)
 	}
 
 	// Check Refinery
 	if r.HasRefinery {
 		sessionName := fmt.Sprintf("gt-%s-refinery", r.Name)
 		running, _ := t.HasSession(sessionName)
-		agents = append(agents, AgentRuntime{
+		refinery := AgentRuntime{
 			Name:    "refinery",
 			Address: r.Name + "/refinery",
 			Session: sessionName,
 			Role:    "refinery",
 			Running: running,
-		})
+		}
+		// Look up agent bead
+		agentID := fmt.Sprintf("gt-refinery-%s", r.Name)
+		if issue, fields, err := agentBeads.GetAgentBead(agentID); err == nil && issue != nil {
+			refinery.HookBead = fields.HookBead
+			refinery.State = fields.AgentState
+			if fields.HookBead != "" {
+				refinery.HasWork = true
+				if pinnedIssue, err := agentBeads.Show(fields.HookBead); err == nil {
+					refinery.WorkTitle = pinnedIssue.Title
+				}
+			}
+		}
+		agents = append(agents, refinery)
 	}
 
 	// Check Polecats
 	for _, name := range r.Polecats {
 		sessionName := fmt.Sprintf("gt-%s-%s", r.Name, name)
 		running, _ := t.HasSession(sessionName)
-		agents = append(agents, AgentRuntime{
+		polecat := AgentRuntime{
 			Name:    name,
 			Address: r.Name + "/" + name,
 			Session: sessionName,
 			Role:    "polecat",
 			Running: running,
-		})
+		}
+		// Look up agent bead
+		agentID := fmt.Sprintf("gt-polecat-%s-%s", r.Name, name)
+		if issue, fields, err := agentBeads.GetAgentBead(agentID); err == nil && issue != nil {
+			polecat.HookBead = fields.HookBead
+			polecat.State = fields.AgentState
+			if fields.HookBead != "" {
+				polecat.HasWork = true
+				if pinnedIssue, err := agentBeads.Show(fields.HookBead); err == nil {
+					polecat.WorkTitle = pinnedIssue.Title
+				}
+			}
+		}
+		agents = append(agents, polecat)
 	}
 
 	// Check Crew
 	for _, name := range crews {
 		sessionName := crewSessionName(r.Name, name)
 		running, _ := t.HasSession(sessionName)
-		agents = append(agents, AgentRuntime{
+		crewAgent := AgentRuntime{
 			Name:    name,
 			Address: r.Name + "/crew/" + name,
 			Session: sessionName,
 			Role:    "crew",
 			Running: running,
-		})
+		}
+		// Look up agent bead
+		agentID := fmt.Sprintf("gt-crew-%s-%s", r.Name, name)
+		if issue, fields, err := agentBeads.GetAgentBead(agentID); err == nil && issue != nil {
+			crewAgent.HookBead = fields.HookBead
+			crewAgent.State = fields.AgentState
+			if fields.HookBead != "" {
+				crewAgent.HasWork = true
+				if pinnedIssue, err := agentBeads.Show(fields.HookBead); err == nil {
+					crewAgent.WorkTitle = pinnedIssue.Title
+				}
+			}
+		}
+		agents = append(agents, crewAgent)
 	}
 
 	return agents
