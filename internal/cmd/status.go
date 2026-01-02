@@ -163,27 +163,42 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("discovering rigs: %w", err)
 	}
 
-	// Create beads instance for agent bead lookups (gastown rig holds gt- prefix beads)
-	gastownBeadsPath := filepath.Join(townRoot, "gastown", "mayor", "rig")
-	agentBeads := beads.New(gastownBeadsPath)
-
-	// Pre-fetch all agent beads in a single query for performance
-	allAgentBeads, _ := agentBeads.ListAgentBeads()
-	if allAgentBeads == nil {
-		allAgentBeads = make(map[string]*beads.Issue)
-	}
-
-	// Pre-fetch all hook beads (referenced in agent beads) in a single query
-	// Use the HookBead field from the database column, not parsed from description.
-	var allHookIDs []string
-	for _, issue := range allAgentBeads {
-		if issue.HookBead != "" {
-			allHookIDs = append(allHookIDs, issue.HookBead)
+	// Pre-fetch agent beads across all rig-specific beads DBs.
+	allAgentBeads := make(map[string]*beads.Issue)
+	allHookBeads := make(map[string]*beads.Issue)
+	for _, r := range rigs {
+		rigBeadsPath := filepath.Join(r.Path, "mayor", "rig")
+		rigBeads := beads.New(rigBeadsPath)
+		rigAgentBeads, _ := rigBeads.ListAgentBeads()
+		if rigAgentBeads == nil {
+			continue
 		}
-	}
-	allHookBeads, _ := agentBeads.ShowMultiple(allHookIDs)
-	if allHookBeads == nil {
-		allHookBeads = make(map[string]*beads.Issue)
+		for id, issue := range rigAgentBeads {
+			allAgentBeads[id] = issue
+		}
+
+		var hookIDs []string
+		for _, issue := range rigAgentBeads {
+			// Use the HookBead field from the database column; fall back for legacy beads.
+			hookID := issue.HookBead
+			if hookID == "" {
+				fields := beads.ParseAgentFields(issue.Description)
+				if fields != nil {
+					hookID = fields.HookBead
+				}
+			}
+			if hookID != "" {
+				hookIDs = append(hookIDs, hookID)
+			}
+		}
+
+		if len(hookIDs) == 0 {
+			continue
+		}
+		hookBeads, _ := rigBeads.ShowMultiple(hookIDs)
+		for id, issue := range hookBeads {
+			allHookBeads[id] = issue
+		}
 	}
 
 	// Create mail router for inbox lookups
@@ -336,7 +351,7 @@ func outputStatusText(status TownStatus) error {
 			icon = roleIcons[agent.Name]
 		}
 		fmt.Printf("%s %s\n", icon, style.Bold.Render(capitalizeFirst(agent.Name)))
-		renderAgentDetails(agent, "   ", nil)
+		renderAgentDetails(agent, "   ", nil, status.Location)
 		fmt.Println()
 	}
 
@@ -369,7 +384,7 @@ func outputStatusText(status TownStatus) error {
 		if len(witnesses) > 0 {
 			fmt.Printf("%s %s\n", roleIcons["witness"], style.Bold.Render("Witness"))
 			for _, agent := range witnesses {
-				renderAgentDetails(agent, "   ", r.Hooks)
+				renderAgentDetails(agent, "   ", r.Hooks, status.Location)
 			}
 			fmt.Println()
 		}
@@ -378,7 +393,7 @@ func outputStatusText(status TownStatus) error {
 		if len(refineries) > 0 {
 			fmt.Printf("%s %s\n", roleIcons["refinery"], style.Bold.Render("Refinery"))
 			for _, agent := range refineries {
-				renderAgentDetails(agent, "   ", r.Hooks)
+				renderAgentDetails(agent, "   ", r.Hooks, status.Location)
 			}
 			// MQ summary (shown under refinery)
 			if r.MQ != nil {
@@ -416,7 +431,7 @@ func outputStatusText(status TownStatus) error {
 		if len(crews) > 0 {
 			fmt.Printf("%s %s (%d)\n", roleIcons["crew"], style.Bold.Render("Crew"), len(crews))
 			for _, agent := range crews {
-				renderAgentDetails(agent, "   ", r.Hooks)
+				renderAgentDetails(agent, "   ", r.Hooks, status.Location)
 			}
 			fmt.Println()
 		}
@@ -425,7 +440,7 @@ func outputStatusText(status TownStatus) error {
 		if len(polecats) > 0 {
 			fmt.Printf("%s %s (%d)\n", roleIcons["polecat"], style.Bold.Render("Polecats"), len(polecats))
 			for _, agent := range polecats {
-				renderAgentDetails(agent, "   ", r.Hooks)
+				renderAgentDetails(agent, "   ", r.Hooks, status.Location)
 			}
 			fmt.Println()
 		}
@@ -440,7 +455,7 @@ func outputStatusText(status TownStatus) error {
 }
 
 // renderAgentDetails renders full agent bead details
-func renderAgentDetails(agent AgentRuntime, indent string, hooks []AgentHookInfo) {
+func renderAgentDetails(agent AgentRuntime, indent string, hooks []AgentHookInfo, townRoot string) {
 	// Line 1: Agent bead ID + status
 	statusStr := style.Success.Render("running")
 	if !agent.Running {
@@ -463,15 +478,16 @@ func renderAgentDetails(agent AgentRuntime, indent string, hooks []AgentHookInfo
 			agentBeadID = beads.AgentBeadID("", parts[0], "")
 		} else if len(parts) >= 2 {
 			rig := parts[0]
+			prefix := beads.GetPrefixForRig(townRoot, rig)
 			if parts[1] == "crew" && len(parts) >= 3 {
-				agentBeadID = beads.CrewBeadID(rig, parts[2])
+				agentBeadID = beads.CrewBeadIDWithPrefix(prefix, rig, parts[2])
 			} else if parts[1] == "witness" {
-				agentBeadID = beads.WitnessBeadID(rig)
+				agentBeadID = beads.WitnessBeadIDWithPrefix(prefix, rig)
 			} else if parts[1] == "refinery" {
-				agentBeadID = beads.RefineryBeadID(rig)
+				agentBeadID = beads.RefineryBeadIDWithPrefix(prefix, rig)
 			} else if len(parts) == 2 {
 				// polecat: rig/name
-				agentBeadID = beads.PolecatBeadID(rig, parts[1])
+				agentBeadID = beads.PolecatBeadIDWithPrefix(prefix, rig, parts[1])
 			}
 		}
 	}
@@ -695,6 +711,8 @@ type agentDef struct {
 func discoverRigAgents(allSessions map[string]bool, r *rig.Rig, crews []string, allAgentBeads map[string]*beads.Issue, allHookBeads map[string]*beads.Issue, mailRouter *mail.Router, skipMail bool) []AgentRuntime {
 	// Build list of all agents to discover
 	var defs []agentDef
+	townRoot := filepath.Dir(r.Path)
+	prefix := beads.GetPrefixForRig(townRoot, r.Name)
 
 	// Witness
 	if r.HasWitness {
@@ -703,7 +721,7 @@ func discoverRigAgents(allSessions map[string]bool, r *rig.Rig, crews []string, 
 			address: r.Name + "/witness",
 			session: witnessSessionName(r.Name),
 			role:    "witness",
-			beadID:  beads.WitnessBeadID(r.Name),
+			beadID:  beads.WitnessBeadIDWithPrefix(prefix, r.Name),
 		})
 	}
 
@@ -714,7 +732,7 @@ func discoverRigAgents(allSessions map[string]bool, r *rig.Rig, crews []string, 
 			address: r.Name + "/refinery",
 			session: fmt.Sprintf("gt-%s-refinery", r.Name),
 			role:    "refinery",
-			beadID:  beads.RefineryBeadID(r.Name),
+			beadID:  beads.RefineryBeadIDWithPrefix(prefix, r.Name),
 		})
 	}
 
@@ -725,7 +743,7 @@ func discoverRigAgents(allSessions map[string]bool, r *rig.Rig, crews []string, 
 			address: r.Name + "/" + name,
 			session: fmt.Sprintf("gt-%s-%s", r.Name, name),
 			role:    "polecat",
-			beadID:  beads.PolecatBeadID(r.Name, name),
+			beadID:  beads.PolecatBeadIDWithPrefix(prefix, r.Name, name),
 		})
 	}
 
@@ -736,7 +754,7 @@ func discoverRigAgents(allSessions map[string]bool, r *rig.Rig, crews []string, 
 			address: r.Name + "/crew/" + name,
 			session: crewSessionName(r.Name, name),
 			role:    "crew",
-			beadID:  beads.CrewBeadID(r.Name, name),
+			beadID:  beads.CrewBeadIDWithPrefix(prefix, r.Name, name),
 		})
 	}
 

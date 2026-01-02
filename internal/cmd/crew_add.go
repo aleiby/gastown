@@ -100,7 +100,8 @@ func runCrewAdd(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  Branch: %s\n", worker.Branch)
 
 		// Create agent bead for the crew worker
-		crewID := beads.CrewBeadID(rigName, name)
+		prefix := beads.GetPrefixForRig(townRoot, rigName)
+		crewID := beads.CrewBeadIDWithPrefix(prefix, rigName, name)
 		if _, err := bd.Show(crewID); err != nil {
 			// Agent bead doesn't exist, create it
 			fields := &beads.AgentFields{
