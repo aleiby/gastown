@@ -507,6 +507,8 @@ func (e *Engineer) handleSuccessFromQueue(mr *mrqueue.MR, result ProcessResult) 
 }
 
 // handleFailureFromQueue handles a failed merge from wisp queue.
+// For conflicts, creates a resolution task and blocks the MR until resolved.
+// This enables non-blocking delegation: the queue continues to the next MR.
 func (e *Engineer) handleFailureFromQueue(mr *mrqueue.MR, result ProcessResult) {
 	// Emit merge_failed event
 	if err := e.eventLogger.LogMergeFailed(mr, result.Error); err != nil {
@@ -514,20 +516,34 @@ func (e *Engineer) handleFailureFromQueue(mr *mrqueue.MR, result ProcessResult) 
 	}
 
 	// If this was a conflict, create a conflict-resolution task for dispatch
+	// and block the MR until the task is resolved (non-blocking delegation)
 	if result.Conflict {
-		if err := e.createConflictResolutionTask(mr, result); err != nil {
+		taskID, err := e.createConflictResolutionTask(mr, result)
+		if err != nil {
 			fmt.Fprintf(e.output, "[Engineer] Warning: failed to create conflict resolution task: %v\n", err)
+		} else {
+			// Block the MR on the conflict resolution task
+			// When the task closes, the MR unblocks and re-enters the ready queue
+			if err := e.mrQueue.SetBlockedBy(mr.ID, taskID); err != nil {
+				fmt.Fprintf(e.output, "[Engineer] Warning: failed to block MR on task: %v\n", err)
+			} else {
+				fmt.Fprintf(e.output, "[Engineer] MR %s blocked on conflict task %s (non-blocking delegation)\n", mr.ID, taskID)
+			}
 		}
 	}
 
-	// MR stays in queue for retry - no action needed on the file
-	// Log the failure
+	// Log the failure - MR stays in queue but may be blocked
 	fmt.Fprintf(e.output, "[Engineer] ✗ Failed: %s - %s\n", mr.ID, result.Error)
-	fmt.Fprintln(e.output, "[Engineer] MR remains in queue for retry")
+	if mr.BlockedBy != "" {
+		fmt.Fprintln(e.output, "[Engineer] MR blocked pending conflict resolution - queue continues to next MR")
+	} else {
+		fmt.Fprintln(e.output, "[Engineer] MR remains in queue for retry")
+	}
 }
 
 // createConflictResolutionTask creates a dispatchable task for resolving merge conflicts.
 // This task will be picked up by bd ready and can be dispatched to an available polecat.
+// Returns the created task's ID for blocking the MR until resolution.
 //
 // Task format:
 //   Title: Resolve merge conflicts: <original-issue-title>
@@ -535,7 +551,7 @@ func (e *Engineer) handleFailureFromQueue(mr *mrqueue.MR, result ProcessResult) 
 //   Priority: inherit from original + boost (P2 -> P1)
 //   Parent: original MR bead
 //   Description: metadata including branch, conflict SHA, etc.
-func (e *Engineer) createConflictResolutionTask(mr *mrqueue.MR, result ProcessResult) error {
+func (e *Engineer) createConflictResolutionTask(mr *mrqueue.MR, result ProcessResult) (string, error) {
 	// Get the current main SHA for conflict tracking
 	mainSHA, err := e.git.Rev("origin/" + mr.Target)
 	if err != nil {
@@ -599,17 +615,42 @@ The Refinery will automatically retry the merge after you force-push.`,
 		Actor:       e.rig.Name + "/refinery",
 	})
 	if err != nil {
-		return fmt.Errorf("creating conflict resolution task: %w", err)
+		return "", fmt.Errorf("creating conflict resolution task: %w", err)
 	}
 
-	// Add dependency: the conflict task depends on nothing, but the MR depends on the task
-	// Note: We don't add the task as parent of the MR since MRs are ephemeral in the queue
-	// The task itself serves as the dispatchable work unit
+	// The conflict task's ID is returned so the MR can be blocked on it.
+	// When the task closes, the MR unblocks and re-enters the ready queue.
 
 	fmt.Fprintf(e.output, "[Engineer] Created conflict resolution task: %s (P%d)\n", task.ID, task.Priority)
 
 	// Update the MR's retry count for priority scoring
 	mr.RetryCount = retryCount
 
-	return nil
+	return task.ID, nil
+}
+
+// IsBeadOpen checks if a bead is still open (not closed).
+// This is used as a status checker for mrqueue.ListReady to filter blocked MRs.
+func (e *Engineer) IsBeadOpen(beadID string) (bool, error) {
+	issue, err := e.beads.Show(beadID)
+	if err != nil {
+		// If we can't find the bead, treat as not open (fail open - allow MR to proceed)
+		return false, nil
+	}
+	// "closed" status means the bead is done
+	return issue.Status != "closed", nil
+}
+
+// ListReadyMRs returns MRs that are ready for processing:
+// - Not claimed by another worker (or claim is stale)
+// - Not blocked by an open task
+// Sorted by priority score (highest first).
+func (e *Engineer) ListReadyMRs() ([]*mrqueue.MR, error) {
+	return e.mrQueue.ListReady(e.IsBeadOpen)
+}
+
+// ListBlockedMRs returns MRs that are blocked by open tasks.
+// Useful for monitoring/reporting.
+func (e *Engineer) ListBlockedMRs() ([]*mrqueue.MR, error) {
+	return e.mrQueue.ListBlocked(e.IsBeadOpen)
 }
