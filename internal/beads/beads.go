@@ -143,7 +143,16 @@ func (b *Beads) run(args ...string) ([]byte, error) {
 	if beadsDir == "" {
 		beadsDir = ResolveBeadsDir(b.workDir)
 	}
-	cmd.Env = append(os.Environ(), "BEADS_DIR="+beadsDir)
+	// Filter out existing BEADS_DIR to ensure our override takes effect
+	// (append would just add a duplicate, and most programs use the first)
+	env := os.Environ()
+	filteredEnv := make([]string, 0, len(env)+1)
+	for _, e := range env {
+		if !strings.HasPrefix(e, "BEADS_DIR=") {
+			filteredEnv = append(filteredEnv, e)
+		}
+	}
+	cmd.Env = append(filteredEnv, "BEADS_DIR="+beadsDir)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
