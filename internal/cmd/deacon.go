@@ -22,6 +22,7 @@ import (
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/tmux"
+	"github.com/steveyegge/gastown/internal/util"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -236,6 +237,27 @@ This removes the pause file and allows the Deacon to work normally.`,
 	RunE: runDeaconResume,
 }
 
+var deaconCleanupOrphansCmd = &cobra.Command{
+	Use:   "cleanup-orphans",
+	Short: "Clean up orphaned claude subagent processes",
+	Long: `Clean up orphaned claude subagent processes.
+
+Claude Code's Task tool spawns subagent processes that sometimes don't clean up
+properly after completion. These accumulate and consume significant memory.
+
+Detection is based on TTY column: processes with TTY "?" have no controlling
+terminal. Legitimate claude instances in terminals have a TTY like "pts/0".
+
+This is safe because:
+- Processes in terminals (your personal sessions) have a TTY - won't be touched
+- Only kills processes that have no controlling terminal
+- These orphans are children of the tmux server with no TTY
+
+Example:
+  gt deacon cleanup-orphans`,
+	RunE: runDeaconCleanupOrphans,
+}
+
 var (
 	triggerTimeout time.Duration
 
@@ -270,6 +292,7 @@ func init() {
 	deaconCmd.AddCommand(deaconStaleHooksCmd)
 	deaconCmd.AddCommand(deaconPauseCmd)
 	deaconCmd.AddCommand(deaconResumeCmd)
+	deaconCmd.AddCommand(deaconCleanupOrphansCmd)
 
 	// Flags for trigger-pending
 	deaconTriggerPendingCmd.Flags().DurationVar(&triggerTimeout, "timeout", 2*time.Second,
@@ -1102,6 +1125,39 @@ func runDeaconResume(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("%s Deacon resumed\n", style.Bold.Render("▶️"))
 	fmt.Println("The Deacon can now perform patrol actions.")
+
+	return nil
+}
+
+// runDeaconCleanupOrphans cleans up orphaned claude subagent processes.
+func runDeaconCleanupOrphans(cmd *cobra.Command, args []string) error {
+	// First, find orphans
+	orphans, err := util.FindOrphanedClaudeProcesses()
+	if err != nil {
+		return fmt.Errorf("finding orphaned processes: %w", err)
+	}
+
+	if len(orphans) == 0 {
+		fmt.Printf("%s No orphaned claude processes found\n", style.Dim.Render("○"))
+		return nil
+	}
+
+	fmt.Printf("%s Found %d orphaned claude process(es)\n", style.Bold.Render("●"), len(orphans))
+
+	// Kill them
+	killed, err := util.CleanupOrphanedClaudeProcesses()
+	if err != nil {
+		style.PrintWarning("cleanup had errors: %v", err)
+	}
+
+	// Report results
+	for _, p := range killed {
+		fmt.Printf("  %s Killed PID %d (%s)\n", style.Bold.Render("✓"), p.PID, p.Cmd)
+	}
+
+	if len(killed) > 0 {
+		fmt.Printf("%s Cleaned up %d orphaned process(es)\n", style.Bold.Render("✓"), len(killed))
+	}
 
 	return nil
 }
