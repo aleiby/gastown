@@ -1,3 +1,5 @@
+//go:build !windows
+
 package util
 
 import (
@@ -7,6 +9,61 @@ import (
 	"strings"
 	"syscall"
 )
+
+// minOrphanAge is the minimum age (in seconds) a process must be before
+// we consider it orphaned. This prevents race conditions with newly spawned
+// processes and avoids killing legitimate short-lived subagents.
+const minOrphanAge = 60
+
+// parseEtime parses ps etime format into seconds.
+// Format: [[DD-]HH:]MM:SS
+// Examples: "01:23" (83s), "01:02:03" (3723s), "2-01:02:03" (176523s)
+func parseEtime(etime string) (int, error) {
+	var days, hours, minutes, seconds int
+
+	// Check for days component (DD-HH:MM:SS)
+	if idx := strings.Index(etime, "-"); idx != -1 {
+		d, err := strconv.Atoi(etime[:idx])
+		if err != nil {
+			return 0, fmt.Errorf("parsing days: %w", err)
+		}
+		days = d
+		etime = etime[idx+1:]
+	}
+
+	// Split remaining by colons
+	parts := strings.Split(etime, ":")
+	switch len(parts) {
+	case 2: // MM:SS
+		m, err := strconv.Atoi(parts[0])
+		if err != nil {
+			return 0, fmt.Errorf("parsing minutes: %w", err)
+		}
+		s, err := strconv.Atoi(parts[1])
+		if err != nil {
+			return 0, fmt.Errorf("parsing seconds: %w", err)
+		}
+		minutes, seconds = m, s
+	case 3: // HH:MM:SS
+		h, err := strconv.Atoi(parts[0])
+		if err != nil {
+			return 0, fmt.Errorf("parsing hours: %w", err)
+		}
+		m, err := strconv.Atoi(parts[1])
+		if err != nil {
+			return 0, fmt.Errorf("parsing minutes: %w", err)
+		}
+		s, err := strconv.Atoi(parts[2])
+		if err != nil {
+			return 0, fmt.Errorf("parsing seconds: %w", err)
+		}
+		hours, minutes, seconds = h, m, s
+	default:
+		return 0, fmt.Errorf("unexpected etime format: %s", etime)
+	}
+
+	return days*86400 + hours*3600 + minutes*60 + seconds, nil
+}
 
 // OrphanedProcess represents a claude process running without a controlling terminal.
 type OrphanedProcess struct {
@@ -23,10 +80,14 @@ type OrphanedProcess struct {
 // - Legitimate terminal sessions always have a TTY (pts/*)
 // - Orphaned subagents have no TTY (?)
 // - Won't accidentally kill user's personal claude instances in terminals
+//
+// Additionally, processes must be older than minOrphanAge seconds to be considered
+// orphaned. This prevents race conditions with newly spawned processes.
 func FindOrphanedClaudeProcesses() ([]OrphanedProcess, error) {
-	// Use ps to get PID, TTY, and command for all processes
+	// Use ps to get PID, TTY, command, and elapsed time for all processes
 	// TTY "?" indicates no controlling terminal
-	out, err := exec.Command("ps", "-eo", "pid,tty,comm").Output()
+	// etime is elapsed time in [[DD-]HH:]MM:SS format (portable across Linux/macOS)
+	out, err := exec.Command("ps", "-eo", "pid,tty,comm,etime").Output()
 	if err != nil {
 		return nil, fmt.Errorf("listing processes: %w", err)
 	}
@@ -34,7 +95,7 @@ func FindOrphanedClaudeProcesses() ([]OrphanedProcess, error) {
 	var orphans []OrphanedProcess
 	for _, line := range strings.Split(string(out), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) < 3 {
+		if len(fields) < 4 {
 			continue
 		}
 
@@ -45,6 +106,7 @@ func FindOrphanedClaudeProcesses() ([]OrphanedProcess, error) {
 
 		tty := fields[1]
 		cmd := fields[2]
+		etimeStr := fields[3]
 
 		// Only look for claude/codex processes without a TTY
 		if tty != "?" {
@@ -54,6 +116,16 @@ func FindOrphanedClaudeProcesses() ([]OrphanedProcess, error) {
 		// Match claude or codex command names
 		cmdLower := strings.ToLower(cmd)
 		if cmdLower != "claude" && cmdLower != "claude-code" && cmdLower != "codex" {
+			continue
+		}
+
+		// Skip processes younger than minOrphanAge seconds
+		// This prevents killing newly spawned subagents and reduces false positives
+		age, err := parseEtime(etimeStr)
+		if err != nil {
+			continue
+		}
+		if age < minOrphanAge {
 			continue
 		}
 
