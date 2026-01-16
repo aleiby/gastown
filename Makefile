@@ -22,11 +22,15 @@ ifeq ($(shell uname),Darwin)
 	@echo "Signed $(BINARY) for macOS"
 endif
 
-install: build
-	cp $(BUILD_DIR)/$(BINARY) ~/.local/bin/$(BINARY)
-ifeq ($(shell uname),Darwin)
-	@codesign -s - -f ~/.local/bin/$(BINARY) 2>/dev/null || true
-endif
+install:
+	@echo "ERROR: 'make install' is deprecated and causes PATH conflicts."
+	@echo ""
+	@echo "Use instead:"
+	@echo "  go install ./cmd/gt"
+	@echo ""
+	@echo "This installs to \$$GOPATH/bin (typically ~/go/bin)."
+	@echo "Ensure ~/go/bin is in your PATH."
+	@exit 1
 
 clean:
 	rm -f $(BUILD_DIR)/$(BINARY)
