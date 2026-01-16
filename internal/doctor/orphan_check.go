@@ -354,9 +354,8 @@ func (c *OrphanProcessCheck) getTmuxSessionPIDs() (map[int]bool, error) { //noli
 
 	// Find tmux server processes using ps instead of pgrep.
 	// pgrep -x tmux is unreliable on macOS - it often misses the actual server.
-	// We use ps with awk to find processes where comm is "tmux" or "tmux:" (server/client).
-	// On Linux, tmux server shows as "tmux: server" which awk splits into $2="tmux:"
-	out, err := exec.Command("sh", "-c", `ps ax -o pid,comm | awk '$2 == "tmux" || $2 == "tmux:" || $2 ~ /\/tmux$/ { print $1 }'`).Output()
+	// We use ps with awk to find processes where comm is exactly "tmux".
+	out, err := exec.Command("sh", "-c", `ps ax -o pid,comm | awk '$2 == "tmux" || $2 ~ /\/tmux$/ { print $1 }'`).Output()
 	if err != nil {
 		// No tmux server running
 		return pids, nil
