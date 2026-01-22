@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
@@ -216,6 +217,12 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 			style.PrintWarning("could not kill pane processes: %v", err)
 		}
 		if err := t.RespawnPane(paneID, startupCmd); err != nil {
+			// If pane is stale (session exists but pane doesn't), recreate the session
+			if strings.Contains(err.Error(), "can't find pane") {
+				fmt.Printf("Stale session detected, recreating...\n")
+				_ = t.KillSession(sessionID)
+				return runCrewAt(cmd, args) // Retry with fresh session
+			}
 			return fmt.Errorf("starting runtime: %w", err)
 		}
 
@@ -265,6 +272,12 @@ func runCrewAt(cmd *cobra.Command, args []string) error {
 				style.PrintWarning("could not kill pane processes: %v", err)
 			}
 			if err := t.RespawnPane(paneID, startupCmd); err != nil {
+				// If pane is stale (session exists but pane doesn't), recreate the session
+				if strings.Contains(err.Error(), "can't find pane") {
+					fmt.Printf("Stale session detected, recreating...\n")
+					_ = t.KillSession(sessionID)
+					return runCrewAt(cmd, args) // Retry with fresh session
+				}
 				return fmt.Errorf("restarting runtime: %w", err)
 			}
 		}
