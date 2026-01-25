@@ -80,11 +80,15 @@ func (m *Manager) Start(agentOverride string) error {
 		return fmt.Errorf("ensuring Claude settings: %w", err)
 	}
 
-	// Build startup command with initial prompt for autonomous patrol.
-	// The prompt triggers GUPP: deacon starts patrol immediately without waiting for input.
-	// This prevents the agent from sitting idle at the prompt after SessionStart hooks run.
-	initialPrompt := "I am Deacon. Start patrol: check gt hook, if empty create mol-deacon-patrol wisp and execute it."
-	startupCmd, err := config.BuildAgentStartupCommandWithAgentOverride("deacon", "", m.townRoot, "", initialPrompt, agentOverride)
+	// Build startup command with beacon for autonomous patrol.
+	// The beacon triggers GUPP: deacon starts patrol immediately without waiting for input.
+	// Using FormatStartupNudge provides sender/recipient context for /resume and agent discovery.
+	beacon := session.FormatStartupNudge(session.StartupNudgeConfig{
+		Recipient: "deacon",
+		Sender:    "daemon",
+		Topic:     "patrol",
+	})
+	startupCmd, err := config.BuildAgentStartupCommandWithAgentOverride("deacon", "", m.townRoot, "", beacon, agentOverride)
 	if err != nil {
 		return fmt.Errorf("building startup command: %w", err)
 	}

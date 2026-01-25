@@ -180,10 +180,20 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		return fmt.Errorf("ensuring runtime settings: %w", err)
 	}
 
-	// Build startup command first
+	// Build startup command with beacon.
+	// Using FormatStartupNudge provides sender/recipient context for /resume and agent discovery.
 	command := opts.Command
 	if command == "" {
-		command = config.BuildPolecatStartupCommand(m.rig.Name, polecat, m.rig.Path, "")
+		topic := "ready"
+		if opts.Issue != "" {
+			topic = "assigned"
+		}
+		beacon := session.FormatStartupNudge(session.StartupNudgeConfig{
+			Recipient: m.rig.Name + "/polecats/" + polecat,
+			Sender:    "witness",
+			Topic:     topic,
+		})
+		command = config.BuildPolecatStartupCommand(m.rig.Name, polecat, m.rig.Path, beacon)
 	}
 	// Prepend runtime config dir env if needed
 	if runtimeConfig.Session != nil && runtimeConfig.Session.ConfigDirEnv != "" && opts.RuntimeConfigDir != "" {

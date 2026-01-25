@@ -134,16 +134,22 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 		return fmt.Errorf("ensuring runtime settings: %w", err)
 	}
 
-	// Build startup command first
+	// Build startup command with beacon for autonomous patrol.
+	// Using FormatStartupNudge provides sender/recipient context for /resume and agent discovery.
+	beacon := session.FormatStartupNudge(session.StartupNudgeConfig{
+		Recipient: m.rig.Name + "/refinery",
+		Sender:    "daemon",
+		Topic:     "patrol",
+	})
 	var command string
 	if agentOverride != "" {
 		var err error
-		command, err = config.BuildAgentStartupCommandWithAgentOverride("refinery", m.rig.Name, townRoot, m.rig.Path, "", agentOverride)
+		command, err = config.BuildAgentStartupCommandWithAgentOverride("refinery", m.rig.Name, townRoot, m.rig.Path, beacon, agentOverride)
 		if err != nil {
 			return fmt.Errorf("building startup command with agent override: %w", err)
 		}
 	} else {
-		command = config.BuildAgentStartupCommand("refinery", m.rig.Name, townRoot, m.rig.Path, "")
+		command = config.BuildAgentStartupCommand("refinery", m.rig.Name, townRoot, m.rig.Path, beacon)
 	}
 
 	// Create session with command directly to avoid send-keys race condition.
