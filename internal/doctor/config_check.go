@@ -879,12 +879,12 @@ func (c *AllowedPrefixesCheck) Run(ctx *CheckContext) *CheckResult {
 }
 
 // Fix sets allowed_prefixes to the required value.
-func (c *AllowedPrefixesCheck) Fix(ctx *CheckContext) error {
+func (c *AllowedPrefixesCheck) Fix(ctx *CheckContext) (string, error) {
 	cmd := exec.Command("bd", "config", "set", "allowed_prefixes", strings.Join(requiredPrefixes, ","))
 	cmd.Dir = c.townRoot
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("bd config set allowed_prefixes: %s", strings.TrimSpace(string(output)))
+		return "", fmt.Errorf("bd config set allowed_prefixes: %s", strings.TrimSpace(string(output)))
 	}
-	return nil
+	return fmt.Sprintf("Set allowed_prefixes to: %s", strings.Join(requiredPrefixes, ",")), nil
 }
