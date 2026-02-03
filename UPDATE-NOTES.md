@@ -15,6 +15,7 @@ upstream/main: 13461161 (v0.5.0+214)
 | #1185 | 3a5cade3 | feat(doctor): extend stale-beads-redirect to verify redirect topology |
 | #1186 | 2192791a | fix(formula): add missing skipped_count variable declaration |
 | #1187 | e3828b82 | fix(test): add --adopt flag to integration tests using local paths |
+| #1188 | 2cef2be5 | fix(doctor): allow identity anchor CLAUDE.md at town root |
 
 ## Build from Source (Linux)
 
