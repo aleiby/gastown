@@ -11,6 +11,8 @@ upstream/main: 13461161 (v0.5.0+214)
 |----|--------|-------------|
 | #1178 | 60efa615 | fix(boot): detect stale molecule progress for idle Deacon |
 | #1179 | 167b5666 | fix(sling): skip nudge when self-slinging |
+| #1185 | 15db89f0 | feat(doctor): add stale-beads-redirect check |
+| #1185 | 3a5cade3 | feat(doctor): extend stale-beads-redirect to verify redirect topology |
 
 ## Build from Source (Linux)
 
