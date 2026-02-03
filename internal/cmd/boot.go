@@ -330,6 +330,16 @@ func runDegradedTriage(b *boot.Boot) (action, target string, err error) {
 
 			// Has work on hook - check if it's actually progressing
 			// by looking at when the last molecule step was closed.
+			//
+			// But first: if deacon is in backoff mode (await-signal), skip
+			// this check. The idle:N label indicates the deacon is legitimately
+			// waiting for signals, not stuck.
+			if isDeaconInBackoff() {
+				// Deacon is in await-signal with backoff - this is expected.
+				// Don't interrupt; it will wake on beads activity.
+				return "nothing", "", nil
+			}
+
 			lastActivity, err := getMoleculeLastActivity(hookBead)
 			if err == nil && !lastActivity.IsZero() && time.Since(lastActivity) > 15*time.Minute {
 				fmt.Printf("Deacon has hooked work but no progress in %s - nudging\n", time.Since(lastActivity).Round(time.Minute))
@@ -340,6 +350,34 @@ func runDegradedTriage(b *boot.Boot) (action, target string, err error) {
 	}
 
 	return "nothing", "", nil
+}
+
+// isDeaconInBackoff checks if the Deacon is in await-signal backoff mode.
+// When in backoff mode, the deacon bead has an "idle:N" label where N >= 0.
+// This indicates the deacon is legitimately waiting for beads activity signals
+// and should not be interrupted for "stale work" - it's supposed to be idle.
+func isDeaconInBackoff() bool {
+	cmd := exec.Command("bd", "show", "hq-deacon", "--json")
+	output, err := cmd.Output()
+	if err != nil {
+		// Can't check - assume not in backoff (conservative)
+		return false
+	}
+
+	var result []struct {
+		Labels []string `json:"labels"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil || len(result) == 0 {
+		return false
+	}
+
+	// Check for idle:N label (any value means await-signal is/was running)
+	for _, label := range result[0].Labels {
+		if len(label) >= 5 && label[:5] == "idle:" {
+			return true
+		}
+	}
+	return false
 }
 
 // getDeaconHookBead returns the bead ID hooked to Deacon, or "" if none.
