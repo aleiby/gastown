@@ -19,6 +19,7 @@ upstream/main: 13461161 (v0.5.0+214)
 | #1193 | ce1c6b90 | fix(boot): skip IDLE_CHECK when Deacon is in await-signal backoff |
 | #1195 | 8575b49a | feat(dashboard): show convoy titles alongside IDs |
 | #1196 | 3d1a95f2 | fix(web): remove os.Executable() to prevent fork bomb in tests |
+| #1198 | 337cc765 | fix(witness): add await-signal backoff to prevent tight loop when idle |
 
 ## Build from Source (Linux)
 
