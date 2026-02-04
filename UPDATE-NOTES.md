@@ -17,6 +17,8 @@ upstream/main: 13461161 (v0.5.0+214)
 | #1187 | e3828b82 | fix(test): add --adopt flag to integration tests using local paths |
 | #1188 | 2cef2be5 | fix(doctor): allow identity anchor CLAUDE.md at town root |
 | #1193 | ce1c6b90 | fix(boot): skip IDLE_CHECK when Deacon is in await-signal backoff |
+| #1195 | 8575b49a | feat(dashboard): show convoy titles alongside IDs |
+| #1196 | 3d1a95f2 | fix(web): remove os.Executable() to prevent fork bomb in tests |
 
 ## Build from Source (Linux)
 
