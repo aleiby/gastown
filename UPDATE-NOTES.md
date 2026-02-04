@@ -20,6 +20,8 @@ upstream/main: 13461161 (v0.5.0+214)
 | #1195 | 8575b49a | feat(dashboard): show convoy titles alongside IDs |
 | #1196 | 3d1a95f2 | fix(web): remove os.Executable() to prevent fork bomb in tests |
 | #1198 | 337cc765 | fix(witness): add await-signal backoff to prevent tight loop when idle |
+| #1199 | cc8f71f6 | docs: add PR branch naming guidance to CONTRIBUTING.md |
+| #1200 | dc0664d9 | feat(doctor): distinguish fixed vs unfixed in --fix output |
 
 ## Build from Source (Linux)
 
