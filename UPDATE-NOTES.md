@@ -23,6 +23,7 @@ upstream/main: 13461161 (v0.5.0+214)
 | #1199 | cc8f71f6 | docs: add PR branch naming guidance to CONTRIBUTING.md |
 | #1200 | dc0664d9 | feat(doctor): distinguish fixed vs unfixed in --fix output |
 | #1200 | b5cbeb00 | fix(doctor): show wrench icon for fixed items in streaming output |
+| #1203 | 0b19d1d4 | fix(await-signal): handle empty stdout when querying agent bead |
 
 ## Build from Source (Linux)
 
