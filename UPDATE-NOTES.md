@@ -52,4 +52,5 @@ origin/main is the source of truth. The stale binary check compares `gt version`
 `~/gt/gastown/mayor/rig` HEAD - if your binary was built from a different commit, you'll
 get warnings.
 
-Binary installs to `~/go/bin/gt` (ensure this is in your PATH).
+Binary installs to `~/go/bin/gt` (ensure this is in your PATH). Remove any stale
+binaries from other locations (e.g., `rm ~/.local/bin/gt`) that might shadow it.
