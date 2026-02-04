@@ -22,6 +22,7 @@ upstream/main: 13461161 (v0.5.0+214)
 | #1198 | 337cc765 | fix(witness): add await-signal backoff to prevent tight loop when idle |
 | #1199 | cc8f71f6 | docs: add PR branch naming guidance to CONTRIBUTING.md |
 | #1200 | dc0664d9 | feat(doctor): distinguish fixed vs unfixed in --fix output |
+| #1200 | b5cbeb00 | fix(doctor): show wrench icon for fixed items in streaming output |
 
 ## Build from Source (Linux)
 
