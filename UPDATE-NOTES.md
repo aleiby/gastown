@@ -34,11 +34,17 @@ COMMIT=$(git rev-parse --short HEAD) && \
 BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ") && \
 go generate ./... && \
 go install -ldflags "-X github.com/steveyegge/gastown/internal/cmd.Version=$VERSION -X github.com/steveyegge/gastown/internal/cmd.Commit=$COMMIT -X github.com/steveyegge/gastown/internal/cmd.BuildTime=$BUILD_TIME -X github.com/steveyegge/gastown/internal/cmd.BuiltProperly=1" ./cmd/gt
-
-# After pushing to origin/main, update the mayor's rig clone to avoid stale binary warnings:
-git -C ~/gt/gastown/mayor/rig pull
 ```
 
-**Important:** Build `gt` only after ALL commits (including this file's updates) are pushed.
-The stale binary warning compares against `~/gt/gastown/mayor/rig` (origin/main). If you build
-before pushing UPDATE-NOTES.md changes, the binary will appear stale.
+### Pre-Build Checklist
+
+1. **Push all commits first** (including UPDATE-NOTES.md updates)
+2. **Sync mayor/rig to origin/main**: `git -C ~/gt/gastown/mayor/rig pull`
+3. **Sync your build workspace** to the same origin/main commit (clean working tree)
+4. **Verify no "dirty" flag** in `git describe --tags --always --dirty`
+
+origin/main is the source of truth. The stale binary check compares `gt version` against
+`~/gt/gastown/mayor/rig` HEAD - if your binary was built from a different commit, you'll
+get warnings.
+
+Binary installs to `~/go/bin/gt` (ensure this is in your PATH).
