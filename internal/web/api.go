@@ -53,15 +53,11 @@ type APIHandler struct {
 
 // NewAPIHandler creates a new API handler.
 func NewAPIHandler() *APIHandler {
-	// Use the current executable as the gt binary (we ARE gt)
-	gtPath := "gt"
-	if exe, err := os.Executable(); err == nil {
-		gtPath = exe
-	}
-	// Capture the current working directory for command execution
+	// Use PATH lookup for gt binary. Do NOT use os.Executable() here - during
+	// tests it returns the test binary, causing fork bombs when executed.
 	workDir, _ := os.Getwd()
 	return &APIHandler{
-		gtPath:  gtPath,
+		gtPath:  "gt",
 		workDir: workDir,
 	}
 }

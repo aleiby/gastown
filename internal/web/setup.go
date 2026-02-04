@@ -203,18 +203,14 @@ func (h *SetupAPIHandler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		port = 8080
 	}
 
-	// Find the gt binary (use the one that's currently running)
-	gtBin, err := os.Executable()
-	if err != nil {
-		h.sendError(w, "Cannot find gt binary: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
+	// Use PATH lookup for gt binary. Do NOT use os.Executable() here - during
+	// tests it returns the test binary, causing fork bombs when executed.
 
 	// Start new dashboard on a DIFFERENT port first, then we'll tell the browser to go there
 	newPort := port + 1
 
 	// Start new dashboard process from the workspace directory
-	cmd := exec.Command(gtBin, "dashboard", "--port", fmt.Sprintf("%d", newPort))
+	cmd := exec.Command("gt", "dashboard", "--port", fmt.Sprintf("%d", newPort))
 	cmd.Dir = path
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
