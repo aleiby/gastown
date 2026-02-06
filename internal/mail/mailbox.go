@@ -150,34 +150,24 @@ func (m *Mailbox) listFromDir(beadsDir string) ([]*Message, error) {
 	}
 
 	// Filter: assignee match (open/hooked) OR CC match (open only)
-	seen := make(map[string]bool)
 	var messages []*Message
 	for i := range allMsgs {
 		bm := &allMsgs[i]
-		if seen[bm.ID] {
-			continue
-		}
-
-		include := false
 
 		// Assignee match: open or hooked status
 		if identitySet[bm.Assignee] && (bm.Status == "open" || bm.Status == "hooked") {
-			include = true
+			messages = append(messages, bm.ToMessage())
+			continue
 		}
 
 		// CC match: open status only
-		if !include && bm.Status == "open" {
+		if bm.Status == "open" {
 			for _, label := range bm.Labels {
 				if ccLabelSet[label] {
-					include = true
+					messages = append(messages, bm.ToMessage())
 					break
 				}
 			}
-		}
-
-		if include {
-			seen[bm.ID] = true
-			messages = append(messages, bm.ToMessage())
 		}
 	}
 
