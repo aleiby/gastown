@@ -146,10 +146,16 @@ func runUnsling(cmd *cobra.Command, args []string) error {
 	}
 
 	if hookedBeadID == "" {
-		if targetAgent != "" {
-			fmt.Printf("%s No work hooked for %s\n", style.Dim.Render("ℹ"), agentID)
-		} else {
-			fmt.Printf("%s Nothing on your hook\n", style.Dim.Render("ℹ"))
+		// hook_bead is empty, but there may be stale beads with status "hooked"
+		// still assigned to this agent (e.g., hook_bead was cleared but bead status
+		// wasn't updated). Clean them up so gt hook and gt unsling stay consistent.
+		cleaned := cleanStaleHookedBeads(cmd, b, agentID, targetBeadID, townRoot, beadsPath)
+		if !cleaned {
+			if targetAgent != "" {
+				fmt.Printf("%s No work hooked for %s\n", style.Dim.Render("ℹ"), agentID)
+			} else {
+				fmt.Printf("%s Nothing on your hook\n", style.Dim.Render("ℹ"))
+			}
 		}
 		return nil
 	}
@@ -229,6 +235,69 @@ func runUnsling(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  Agent %s hook cleared (was: %s)\n", agentID, hookedBeadID)
 
 	return nil
+}
+
+// cleanStaleHookedBeads finds and cleans up beads with status "hooked" assigned to
+// agentID when the agent bead's hook_bead field is already null. This handles the
+// inconsistency where hook_bead was cleared (e.g., by another process) but the
+// bead's status wasn't updated back to "open". Without this, gt hook shows the
+// stale hook (via fallback query) but gt unsling says "Nothing on your hook".
+// Returns true if any stale beads were cleaned up.
+func cleanStaleHookedBeads(cmd *cobra.Command, b *beads.Beads, agentID, targetBeadID, townRoot, beadsPath string) bool {
+	// Query for beads with status=hooked assigned to this agent
+	staleBeads, err := b.List(beads.ListOptions{
+		Status:   beads.StatusHooked,
+		Assignee: agentID,
+		Priority: -1,
+	})
+	if err != nil || len(staleBeads) == 0 {
+		return false
+	}
+
+	// If a specific bead was requested, filter to only that one
+	if targetBeadID != "" {
+		var filtered []*beads.Issue
+		for _, sb := range staleBeads {
+			if sb.ID == targetBeadID {
+				filtered = append(filtered, sb)
+			}
+		}
+		if len(filtered) == 0 {
+			return false
+		}
+		staleBeads = filtered
+	}
+
+	if unslingDryRun {
+		for _, sb := range staleBeads {
+			fmt.Printf("Would clean up stale hooked bead %s (%s)\n", sb.ID, sb.Title)
+		}
+		return true
+	}
+
+	// Clean up each stale hooked bead
+	for _, sb := range staleBeads {
+		fmt.Printf("%s Cleaning up stale hooked bead %s...\n", style.Bold.Render("🪝"), sb.ID)
+
+		// Resolve the correct beads directory for this bead
+		stalePath := beads.ResolveHookDir(townRoot, sb.ID, beadsPath)
+		staleB := b
+		if stalePath != beadsPath {
+			staleB = beads.New(stalePath)
+		}
+
+		openStatus := "open"
+		emptyAssignee := ""
+		if err := staleB.Update(sb.ID, beads.UpdateOptions{
+			Status:   &openStatus,
+			Assignee: &emptyAssignee,
+		}); err != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "Warning: couldn't clean up stale bead %s: %v\n", sb.ID, err)
+			continue
+		}
+		fmt.Printf("%s Cleaned up stale bead %s (was hooked, now open)\n", style.Bold.Render("✓"), sb.ID)
+	}
+	return true
 }
 
 // isAgentTarget checks if a string looks like an agent target rather than a bead ID.
