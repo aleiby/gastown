@@ -22,7 +22,7 @@ Nudges need to be 100% reliable with low latency (max handful of seconds), but t
 
 Instead of Ctrl-C (which sends SIGINT and risks interrupting the agent or triggering exit), use **Home+Ctrl-K** to clear input line-by-line. This sends no signals, carries no exit risk, and works reliably in terminal TUI applications.
 
-A **sentinel string** inserted at the cursor position before the initial capture provides an anchor point that eliminates the need for prompt detection, diff algorithms, or format-specific parsing. The sentinel tells us exactly which line the cursor is on, giving us the optimal capture window size for convergence detection.
+A **sentinel string** re-inserted on each line during clearing provides exact content extraction and reliable boundary detection without prompt parsing, diff algorithms, or format-specific assumptions. The content after the sentinel is the raw user input; suffix comparison against adjacent lines in the previous capture determines when the input boundary has been crossed.
 
 ### Why Not Ctrl-C?
 
@@ -60,45 +60,44 @@ The previous design used Ctrl-C to clear input. This has fundamental problems:
 └────────────────────────┬────────────────────────────────────────────────┘
                          ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  SENTINEL                                                               │
-│  1. Home (go to beginning of current line — avoids line-wrap issues)    │
-│  2. Insert sentinel: §XXXX§ (4-char hash + bookends, 6 chars total)    │
-│  3. Wait 50ms for TUI to render                                        │
+│  IDENTIFY current line                                                  │
+│  Home, insert §XXXX§, wait 50ms, capture                               │
+│  Find sentinel → extract content after sentinel → collect[0]            │
 └────────────────────────┬────────────────────────────────────────────────┘
                          ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  CAPTURE (one-time full scrollback capture)                             │
-│  tmux capture-pane -p -S -                                              │
-│  Find sentinel searching backward from end of capture                   │
-│  Compute N = lines from sentinel to bottom of capture                   │
-│  N is the capture window for all subsequent convergence checks          │
+│  CLEAR UPWARD (preceding lines)                                         │
+│  loop:                                                                  │
+│    Home, Ctrl-K, Backspace, Home, insert §XXXX§, wait 50ms, capture    │
+│    content = text after sentinel                                        │
+│    verify: prev_capture[sentinel_line - 1] ends with content            │
+│    if no match → boundary reached, switch direction                     │
+│    if match → prepend to collected lines, continue                      │
 └────────────────────────┬────────────────────────────────────────────────┘
                          ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  CLEAR + COLLECT (convergence loop)                                     │
-│  prev = captureLast(N+2)   (+2 for visibility above sentinel)          │
-│  loop (max 30 iterations):                                              │
-│    Home + Ctrl-K                                                        │
-│    wait 50ms                                                            │
-│    cur = captureLast(N+2)                                                │
-│    collect disappeared line content (see Input Restoration)             │
-│    if cur == prev → break (converged, input is clear)                   │
-│    if len(cur) > len(prev) + threshold → abort (external input)         │
-│    prev = cur                                                           │
+│  CLEAR DOWNWARD (following lines)                                       │
+│  loop:                                                                  │
+│    Home, Ctrl-K, Ctrl-K, insert §XXXX§, wait 50ms, capture             │
+│    content = text after sentinel                                        │
+│    verify: prev_capture[sentinel_line + 1] ends with content            │
+│    if no match → boundary reached, done clearing                        │
+│    if match → append to collected lines, continue                       │
 └────────────────────────┬────────────────────────────────────────────────┘
                          ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  INJECT nudge message                                                   │
+│  INJECT nudge                                                           │
+│  Home, Ctrl-K (clear final sentinel)                                    │
 │  send-keys -l "nudge message"                                           │
 │  wait 50ms                                                              │
 │  Send Escape (vim mode compat) + Enter                                  │
 └────────────────────────┬────────────────────────────────────────────────┘
                          ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  RESTORE original user input                                            │
+│  RESTORE original user input (future)                                   │
 │  Original input was collected during CLEAR phase                        │
 │  Inject via send-keys -l after agent finishes processing nudge          │
-│  (Requires coordination to detect agent completion — future work)       │
+│  (Requires coordination to detect agent completion)                     │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -150,45 +149,43 @@ func findSentinelFromEnd(capture, sentinel string) (lineIdx, linesFromBottom int
 
 ### Sentinel Lifecycle
 
-1. Inserted before the initial full capture
-2. Found in the capture to establish cursor line position
-3. Cleared naturally by the first Home+Ctrl-K iteration (it's at the beginning of the line being cleared)
-4. No cleanup step needed
+1. Inserted via Home + sentinel on each line to identify content
+2. Found in capture to extract content (everything after sentinel on that line)
+3. Cleared by Home+Ctrl-K before navigating to the next line
+4. Re-inserted on the next line after navigation (Backspace up or Ctrl-K down)
+5. Final sentinel cleared before nudge injection
 
-## Convergence Detection
+## Boundary Detection via Suffix Comparison
 
 ### How It Works
 
-After each Home+Ctrl-K, capture the last N lines of the pane (where N was determined by the sentinel position). Compare with the previous capture byte-for-byte. When the capture stops changing, clearing is complete.
+After each sentinel insertion, the content after the sentinel is compared with the adjacent line from the previous capture. If the adjacent line **ends with** the sentinel content, the new line is still within the input field. If not (or if content is empty), we've crossed the boundary.
 
-### Why Convergence Works
+This eliminates the need for convergence detection — the algorithm knows exactly when to stop in each direction.
 
-- Each Home+Ctrl-K removes content from the input area, changing the capture
-- When nothing remains to clear, Home+Ctrl-K is a no-op and the capture is unchanged
-- The capture window (last N lines) is isolated from agent output changes above the input field
-- No format-specific parsing needed — pure byte comparison
+### Why Suffix Comparison Works
 
-### Clearing Mechanics (Tested)
+- TUI formatting adds **prefixes** (prompt `>`, indentation spaces) to input lines
+- The sentinel is inserted after Home, so content after sentinel is the raw input text
+- Raw input text always appears as a **suffix** of the formatted line
+- Non-input lines (separators, agent output, status) have entirely different content that won't suffix-match
 
-Each input line requires **2 Home+Ctrl-K iterations**: one kills the text content, one kills the newline. For M lines of input, expect 2M iterations before convergence, plus 1 final iteration to confirm.
+### Clearing Mechanics
 
-| Input Lines | Iterations to Converge | Duration (50ms delay) |
+Each line requires one sentinel-per-line iteration: insert sentinel, capture, extract content, clear + navigate. The protocol handles lines in both directions from the cursor:
+
+| Input Lines | Iterations (up + down) | Approximate Duration |
 |------------|----------------------|----------------------|
-| 0 (empty)  | 2                    | ~230ms               |
-| 1          | 2                    | ~220ms               |
-| 3          | 6                    | ~470ms               |
-| 5          | 10                   | ~690ms               |
-| 10         | 20                   | ~1.2s                |
+| 0 (empty)  | 1 (identify only)    | ~100ms               |
+| 1          | 1 + 2 boundary checks | ~300ms              |
+| 3          | 3 + 2 boundary checks | ~500ms              |
+| 5          | 5 + 2 boundary checks | ~700ms              |
+
+Each iteration involves ~6 tmux send-keys calls + 1 capture + 50ms delay.
 
 ### Safety: Abort on External Input
 
-If the capture **grows** between iterations (beyond a small threshold for status bar updates), someone is typing or navigating. Abort the clear operation and let the daemon retry later.
-
-```go
-if len(cur) > len(prev) + 50 {
-    return ErrExternalInput
-}
-```
+If the capture changes in unexpected ways between iterations (content appears that wasn't in the previous capture's adjacent lines), someone is typing. Abort and let the daemon retry later.
 
 ## Edge Cases
 
@@ -196,98 +193,208 @@ if len(cur) > len(prev) + 50 {
 |-----------|-----------|----------|
 | Copy mode | `#{pane_in_mode} == 1` | Defer to next cycle |
 | Large paste placeholder | `[Pasted text #N +X lines]` in last 50 lines | Defer |
-| User typing during clear | Capture grows between iterations | Abort, daemon retries |
-| User navigating input | Content changes between captures | Abort, daemon retries |
-| Cursor mid-input | Sentinel on interior line, input above and below | Deletion tracking captures all directions |
-| Empty input (common case) | Sentinel cleared in 1 iter, convergence in 2 | Fast path: ~230ms total |
+| User typing during clear | Unexpected content in captures | Abort, daemon retries |
+| Cursor mid-input | Sentinel on interior line, input above and below | Bidirectional clearing (up then down) |
+| Empty input (common case) | Identify step finds empty content | Fast path: clear sentinel + inject |
 | Sentinel not found | Not in capture | Return ErrSentinelNotFound |
 | Input field at terminal width | Sentinel inserted after Home (line start) | No wrap possible |
-| Agent output during clear | Output is above capture window (N lines from bottom) | Not visible in convergence captures |
 | Vim mode enabled | Ctrl-K is a digraph key in insert mode | Needs detection/alternate path (future) |
+| Empty line in multi-line input | Content after sentinel is empty | May trigger premature boundary detection (see Open Questions) |
 
-## Input Restoration via Deletion Tracking
+## Input Collection via Sentinel-Per-Line
 
 ### Key Insight
 
-The convergence loop already compares consecutive captures. By observing what **disappears** between iterations, we reconstruct the original input as a side effect of clearing — no separate diff algorithm or format-specific parsing needed.
+Instead of observing what disappears between captures (which requires diffing), **re-insert the sentinel on each line** before clearing it. The content after the sentinel is the exact input text for that line, with TUI-added prefixes (prompt characters, indentation) excluded automatically.
 
-### How It Works
+Boundary detection uses **suffix comparison**: the content after the sentinel on the new line should appear as a suffix of the adjacent line from the previous capture. If not, we've left the input field — no format-specific parsing needed.
 
-Each Home+Ctrl-K iteration removes one visual line of content. By comparing `prev` and `cur` captures, the line present in `prev` but absent in `cur` is the content that was just cleared. Collect these lines during the convergence loop to reconstruct the full original input.
+### Three Operations
 
-### Capture Window: N+2
+| Operation | Keys | Effect |
+|-----------|------|--------|
+| **Identify** | `C-a, {sentinel}` | Read current line content |
+| **Delete + go up** | `C-a, C-k, BSpace, C-a, {sentinel}` | Kill content, backspace joins with line above, home, re-sentinel |
+| **Delete + go down** | `C-a, C-k, C-k, {sentinel}` | Kill content, kill newline (joins with line below), sentinel on now-current line |
 
-The convergence capture uses `N+2` lines instead of `N` (where N = lines from sentinel to bottom). The extra lines provide visibility into input lines **above** the sentinel that haven't entered the clearing zone yet. As lines are cleared and the TUI redraws, content from above scrolls into the capture window. The +2 ensures we see each line before it gets cleared, making the comparison more reliable.
+### Walkthrough: Cursor on Line 2 of 3-line Input
 
-### Cursor Position: Mid-Input
-
-The cursor can be on **any line** of multi-line input, not just the bottom. Arrow keys navigate within multi-line input in Claude Code and other TUIs. This means the sentinel may land on an interior line, with input both above and below it.
+**Step 1: Identify current line** — `C-a, {sentinel}`
 
 ```
-Line 1 of input
-§XXXX§Line 2 of input        ← sentinel (cursor was here)
-Line 3 of input
+Capture A:
+  57: ---------
+  58:  > Line 1
+  59:    §XXXX§Line 2
+  60:    Line 3
+  61: ---------
 ```
 
-As clearing progresses, lines both above and below the sentinel get cleared. The deletion-tracking approach captures all of them regardless of direction — whatever disappears between captures is collected.
+A[59]: content after sentinel = `"Line 2"`. Collect it.
 
-### Reconstruction
+```
+collected = ["Line 2"]
+```
 
-The initial full capture provides the sentinel's position. From this we know:
-- **Sentinel line content**: everything after `§XXXX§` on the sentinel line
-- **Lines below sentinel**: visible in the initial capture between the sentinel line and non-input content (separator/status)
+**Step 2: Delete current + go up** — `C-a, C-k, BSpace, C-a, {sentinel}`
 
-During clearing, lines are collected in the order they're cleared (starting from the sentinel line, then expanding outward as lines collapse). The initial full capture provides the ordering context needed to reconstruct the original multi-line input in the correct order.
+```
+Capture B:
+  10:  * Thinking...
+  11:
+  12: ---------
+  13:  > §XXXX§Line 1
+  14:    Line 3
+  15: ---------
+  16:
+  17:  Status: Updated.
+```
+
+B[13]: content after sentinel = `"Line 1"`.
+Verify: does A[sentinel_line - 1] = A[58] = `" > Line 1"` end with `"Line 1"`? **Yes** → prepend.
+
+```
+collected = ["Line 1", "Line 2"]
+```
+
+**Step 3: Delete current + go up** — `C-a, C-k, BSpace, C-a, {sentinel}`
+
+```
+Capture C:
+  10: ---------
+  11:  > §XXXX§
+  12:    Line 3
+  13: ---------
+```
+
+C[11]: content after sentinel = `""` (empty).
+Verify: does B[sentinel_line - 1] = B[12] = `"---------"` end with `""`?
+Empty is a trivial suffix, but `"---------"` is clearly a separator — **boundary reached**. Switch direction.
+
+**Step 4: Delete current + go down** — `C-a, C-k, C-k, {sentinel}`
+
+```
+Capture D:
+  10: ---------
+  11:  > §XXXX§Line 3
+  12: ---------
+```
+
+D[11]: content after sentinel = `"Line 3"`.
+Verify: does C[sentinel_line + 1] = C[12] = `"   Line 3"` end with `"Line 3"`? **Yes** → append.
+
+```
+collected = ["Line 1", "Line 2", "Line 3"]
+```
+
+**Step 5: Delete current + go down** — `C-a, C-k, C-k, {sentinel}`
+
+```
+Capture E:
+  10: ---------
+  11:  > §XXXX§
+  12: ---------
+```
+
+E[11]: content after sentinel = `""` (empty).
+Verify: does D[sentinel_line + 1] = D[12] = `"---------"` end with `""`?
+Separator — **boundary reached**. Done clearing.
+
+**Step 6: Inject nudge** — `C-a, C-k, {nudge}`
+
+Clear the final sentinel and inject the nudge message.
+
+### Suffix Comparison for Boundary Detection
+
+The content after the sentinel on each line is the **raw user input** without TUI formatting. The adjacent line from the previous capture has TUI formatting (prompt `>`, indentation, etc.). The suffix comparison bridges this:
+
+```
+Adjacent line:     " > Line 1"     (TUI-formatted)
+After sentinel:    "Line 1"        (raw input)
+Suffix match:      ✓ " > Line 1" ends with "Line 1"
+```
+
+When we cross the input boundary into a separator or agent output:
+
+```
+Adjacent line:     "---------"     (non-input)
+After sentinel:    ""              (empty — nothing after sentinel)
+Suffix match:      Trivially yes, but empty content = boundary
+```
+
+The boundary check is: content after sentinel must be **non-empty** AND appear as a suffix of the adjacent line. Empty content always signals a boundary.
+
+### Implementation
 
 ```go
-func clearAndCollect(captureN int, sentinel string) (originalInput string, err error) {
-    var deletedLines []string
-    windowN := captureN + 2
-    prev := captureLast(windowN)
+func clearAndCollect(sentinel string) ([]string, error) {
+    var collected []string
 
+    // Step 1: Identify current line
+    sendKeys("Home")
+    sendKeys("-l", sentinel)
+    time.Sleep(50 * time.Millisecond)
+    prev := capture()
+    sentLine := findSentinelLine(prev, sentinel)
+    content := extractAfterSentinel(prev, sentLine, sentinel)
+    if content != "" {
+        collected = append(collected, content)
+    }
+
+    // Step 2: Clear upward
     for i := 0; i < maxIters; i++ {
-        sendKeys("Home")
-        sendKeys("C-k")
+        adjLine := getLine(prev, sentLine - 1)
+        sendKeys("Home"); sendKeys("C-k"); sendKeys("BSpace")
+        sendKeys("Home"); sendKeys("-l", sentinel)
         time.Sleep(50 * time.Millisecond)
+        cur := capture()
+        sentLine = findSentinelLine(cur, sentinel)
+        content = extractAfterSentinel(cur, sentLine, sentinel)
 
-        cur := captureLast(windowN)
-        if cur == prev {
-            break // converged
+        if content == "" || !strings.HasSuffix(adjLine, content) {
+            break // boundary reached
         }
-
-        // Safety: abort if capture grew (external input)
-        if len(cur) > len(prev) + 50 {
-            return "", ErrExternalInput
-        }
-
-        // Find content that disappeared between captures
-        deleted := findDisappeared(prev, cur)
-        if deleted != "" {
-            deletedLines = append(deletedLines, deleted)
-        }
-
+        collected = append([]string{content}, collected...) // prepend
         prev = cur
     }
 
-    // Strip sentinel from the first collected line
-    if len(deletedLines) > 0 {
-        deletedLines[0] = strings.TrimPrefix(deletedLines[0], sentinel)
+    // Step 3: Clear downward
+    for i := 0; i < maxIters; i++ {
+        adjLine := getLine(prev, sentLine + 1)
+        sendKeys("Home"); sendKeys("C-k"); sendKeys("C-k")
+        sendKeys("-l", sentinel)
+        time.Sleep(50 * time.Millisecond)
+        cur := capture()
+        sentLine = findSentinelLine(cur, sentinel)
+        content = extractAfterSentinel(cur, sentLine, sentinel)
+
+        if content == "" || !strings.HasSuffix(adjLine, content) {
+            break // boundary reached
+        }
+        collected = append(collected, content) // append
+        prev = cur
     }
 
-    // Reverse: collected bottom-to-top during clearing
-    slices.Reverse(deletedLines)
-    return strings.Join(deletedLines, "\n"), nil
+    // Step 4: Clean up final sentinel
+    sendKeys("Home"); sendKeys("C-k")
+
+    return collected, nil
 }
 ```
 
-### Restoration Delivery
+### Comparison with Previous Approaches
 
-After the nudge is delivered and the agent processes it, the collected input can be restored via `send-keys -l`. This requires knowing when the agent has finished processing the nudge — a coordination problem that can be solved by waiting for the agent's response to appear in the capture, or by deferring restoration to the next daemon cycle.
+| Approach | Pros | Cons |
+|----------|------|------|
+| **Sentinel-per-line** (current) | Exact content, reliable boundaries, handles cursor mid-input, no diffing | More keystrokes per line (~6 vs ~2), more captures |
+| Convergence + deletion tracking | Fewer operations per line | Can't distinguish input from non-input boundaries |
+| Myers diff (original PR #1212) | Full before/after comparison | Requires Ctrl-C, complex diff logic, fragmentation issues |
 
 ### Open Questions
 
-- **Clearing direction**: When the cursor is mid-input, does clearing proceed upward, downward, or from the cursor line outward? Needs testing to verify line ordering during collection.
-- **Line wrapping**: If a single logical input line wraps across two visual lines, the two visual lines would be collected separately. Joining them requires detecting wrap boundaries (lines without trailing newlines in the original input).
+- **Empty input lines**: An empty line within multi-line input would produce `""` after the sentinel, triggering boundary detection prematurely. Needs testing to determine if this is a real scenario.
+- **Backspace behavior**: Does Backspace at the beginning of a line reliably join with the line above in Claude Code's ink TUI? Needs testing.
+- **Line wrapping**: If a logical input line wraps across visual lines, each visual line gets its own sentinel iteration. The suffix comparison should still work, but reconstruction needs to detect and join wrapped lines.
 
 ## Timing
 
