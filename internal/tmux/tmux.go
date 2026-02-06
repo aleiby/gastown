@@ -33,10 +33,10 @@ var (
 	ErrSessionNotFound = errors.New("session not found")
 
 	// Nudge delivery errors
-	ErrPaneInMode      = errors.New("pane is in copy/blocking mode")
+	ErrPaneInMode       = errors.New("pane is in copy/blocking mode")
 	ErrPastePlaceholder = errors.New("paste placeholder detected")
-	ErrNudgeNotFound   = errors.New("nudge not found after injection")
-	ErrMaxRetries      = errors.New("max retries exhausted")
+	ErrNudgeNotFound    = errors.New("nudge not found after injection")
+	ErrUserTyping       = errors.New("user typing detected during injection")
 )
 
 // Tmux wraps tmux operations.
@@ -744,7 +744,7 @@ func (t *Tmux) WakePaneIfDetached(target string) {
 //
 // Uses the Clear/Inject/Verify/Restore protocol:
 // 1. Captures any existing user input
-// 2. Clears the input field (Ctrl-C)
+// 2. Clears the input field (Ctrl-U)
 // 3. Injects the nudge message
 // 4. Verifies the nudge arrived intact
 // 5. Sends Enter to submit

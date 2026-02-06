@@ -6,25 +6,13 @@ import (
 	"time"
 )
 
-// Timing constants for the Clear/Inject/Verify/Restore protocol.
+// Timing constants for the Clear/Inject/Verify protocol.
 const (
 	// nudgeClearDelayMs is the time to wait after Ctrl-C for input to clear.
 	nudgeClearDelayMs = 50
 
 	// nudgeInjectDelayMs is the time to wait after injecting text before verification.
 	nudgeInjectDelayMs = 50
-
-	// nudgeLullDetectMs is the time to detect a typing pause before retry.
-	nudgeLullDetectMs = 300
-
-	// nudgeMaxRetries is the maximum retries before giving up.
-	nudgeMaxRetries = 2
-
-	// nudgeContextLines is how many lines of context to use for matching.
-	nudgeContextLines = 5
-
-	// nudgeTailCaptureLines is how many lines to capture for verification.
-	nudgeTailCaptureLines = 30
 
 	// nudgePastePlaceholderLines is how many lines to scan for paste placeholder.
 	nudgePastePlaceholderLines = 50
@@ -34,144 +22,120 @@ const (
 // Example: "[Pasted text #3 +47 lines]"
 var pastedTextPlaceholderRe = regexp.MustCompile(`\[Pasted text #\d+ \+\d+ lines\]`)
 
-// preservedInput accumulates user input that needs to be restored.
-type preservedInput struct {
-	original    []byte // From BEFORE capture (what was there initially)
-	extraBefore []byte // Text before nudge in AFTER (typed after Ctrl-C)
-	extraAfter  []byte // Text after nudge in AFTER (typed during inject)
-}
-
-// combined returns all preserved input concatenated.
-func (p *preservedInput) combined() []byte {
-	total := len(p.original) + len(p.extraBefore) + len(p.extraAfter)
-	if total == 0 {
-		return nil
-	}
-	result := make([]byte, 0, total)
-	result = append(result, p.original...)
-	result = append(result, p.extraBefore...)
-	result = append(result, p.extraAfter...)
-	return result
-}
-
-// nudgeSessionReliable implements the Clear/Inject/Verify/Restore protocol.
-// This preserves any user input that was in the field when the nudge arrives.
+// nudgeSessionReliable implements the Clear/Inject/Verify protocol.
 //
 // Protocol:
 // 1. Check if pane is in blocking mode (copy mode, etc.)
-// 2. Capture full scrollback BEFORE
+// 2. Capture BEFORE (full scrollback as byte stream)
 // 3. Clear input with Ctrl-C
 // 4. Inject nudge text (NO Enter yet)
-// 5. Capture tail AFTER
-// 6. Verify nudge integrity (detect user typing during injection)
-// 7. If clean, send Enter
-// 8. Restore any preserved user input
+// 5. Capture AFTER
+// 6. Run Myers diff and find the nudge hunk
+// 7. Verify clean delivery (no gap typing, no after-nudge typing)
+// 8. If clean, send Enter
+// 9. If not clean, return error (caller can retry later)
+//
+// Detection uses Myers diff algorithm to compare BEFORE and AFTER:
+// - Handles multiple disjoint changes (scrolling, new output, input changes, ads)
+// - Absorbs spurious character-level matches (threshold: 4 bytes)
+// - Extracts: original input, gap typing, after-nudge typing
+// - Clean delivery = no gap typing AND no after-nudge typing
+//
+// ============================================================================
+// WARNING: NEVER SEND A SECOND CTRL-C IN THIS FUNCTION!
+// ============================================================================
+// Two Ctrl-C's in quick succession exits Claude Code. This was learned the
+// hard way - retry logic that sent Ctrl-C to "clear and retry" would kill
+// agent sessions. If anything goes wrong after the first Ctrl-C, we return
+// an error and let the caller retry later (daemon retries on next 2-second
+// pass). DO NOT add retry logic that sends another Ctrl-C!
+// ============================================================================
 //
 // Returns nil on success, error on failure.
 func (t *Tmux) nudgeSessionReliable(session, message string) error {
-	preserved := &preservedInput{}
-
 	// Pre-check: is pane in blocking mode?
 	if t.IsPaneInMode(session) {
-		// Can't deliver while in copy mode - but this is transient
-		// Return error and let caller retry if needed
 		return ErrPaneInMode
 	}
 
-	for retry := 0; retry <= nudgeMaxRetries; retry++ {
-		// Step 1: Capture BEFORE (full scrollback)
-		beforeFull, err := t.capturePaneFull(session)
-		if err != nil {
-			return err
-		}
-
-		// Check for large paste placeholder
-		if hasPastedTextPlaceholder(beforeFull, nudgePastePlaceholderLines) {
-			// User is in the middle of a large paste operation
-			return ErrPastePlaceholder
-		}
-
-		// Step 2: Clear input with Ctrl-C
-		if err := t.SendKeysRaw(session, "C-c"); err != nil {
-			return err
-		}
-		time.Sleep(nudgeClearDelayMs * time.Millisecond)
-
-		// Step 3: Inject nudge text (NO Enter yet)
-		if err := t.SendKeysLiteral(session, message); err != nil {
-			t.restoreInput(session, preserved)
-			return err
-		}
-		time.Sleep(nudgeInjectDelayMs * time.Millisecond)
-
-		// Step 4: Capture AFTER (tail only)
-		afterTail, err := t.capturePaneTail(session, nudgeTailCaptureLines)
-		if err != nil {
-			t.restoreInput(session, preserved)
-			return err
-		}
-
-		// Step 5: Verify nudge integrity
-		found, textBefore, textAfter, corrupted := verifyNudgeIntegrity(afterTail, message)
-
-		if !found {
-			// Nudge didn't appear - something went wrong
-			t.restoreInput(session, preserved)
-			return ErrNudgeNotFound
-		}
-
-		if corrupted {
-			// Nudge was corrupted - clear and retry
-			_ = t.SendKeysRaw(session, "C-c")
-			time.Sleep(nudgeClearDelayMs * time.Millisecond)
-			continue
-		}
-
-		// Accumulate any extra text (user was typing)
-		preserved.extraBefore = append(preserved.extraBefore, textBefore...)
-		preserved.extraAfter = append(preserved.extraAfter, textAfter...)
-
-		// Check if input is clean (only nudge)
-		if len(textBefore) == 0 && len(textAfter) == 0 {
-			// Clean delivery - send Enter
-			// Send Escape first for vim mode compatibility
-			_, _ = t.run("send-keys", "-t", session, "Escape")
-			time.Sleep(100 * time.Millisecond)
-
-			if err := t.SendKeysRaw(session, "Enter"); err != nil {
-				t.restoreInput(session, preserved)
-				return err
-			}
-
-			// Find and store original input for restoration
-			preserved.original = findOriginalInput(beforeFull, afterTail, message)
-
-			// Restore any accumulated input
-			t.restoreInput(session, preserved)
-
-			// Wake the pane for detached sessions
-			t.WakePaneIfDetached(session)
-			return nil
-		}
-
-		// Extra text detected - user was typing
-		// Wait for typing lull before retry
-		if retry < nudgeMaxRetries {
-			if !t.waitForTypingLull(session, nudgeLullDetectMs*time.Millisecond) {
-				// Continuous typing - clear current attempt and retry
-				_ = t.SendKeysRaw(session, "C-c")
-				time.Sleep(nudgeClearDelayMs * time.Millisecond)
-				continue
-			}
-			// Clear for retry
-			_ = t.SendKeysRaw(session, "C-c")
-			time.Sleep(nudgeClearDelayMs * time.Millisecond)
-		}
+	// Step 1: Capture BEFORE (full scrollback as byte stream)
+	before, err := t.capturePaneFull(session)
+	if err != nil {
+		return err
 	}
 
-	// Max retries exhausted - restore what we have and return error
-	t.restoreInput(session, preserved)
-	return ErrMaxRetries
+	// Check for large paste placeholder
+	if hasPastedTextPlaceholder(before, nudgePastePlaceholderLines) {
+		return ErrPastePlaceholder
+	}
+
+	// Step 2: Clear input with Ctrl-C
+	// WARNING: This is the ONLY Ctrl-C we send. See warning in function header.
+	//
+	// Send space + Ctrl-C atomically to break any "double Ctrl-C = exit" detection
+	// window from previous Ctrl-C's (e.g., daemon retry queue delivering multiple nudges).
+	// The space is harmless - Ctrl-C clears the input line anyway.
+	// Sending both in one tmux call ensures they arrive together.
+	if _, err := t.run("send-keys", "-t", session, " ", "C-c"); err != nil {
+		return err
+	}
+	time.Sleep(nudgeClearDelayMs * time.Millisecond)
+
+	// Step 3: Inject nudge text (NO Enter yet)
+	if err := t.SendKeysLiteral(session, message); err != nil {
+		return err
+	}
+	time.Sleep(nudgeInjectDelayMs * time.Millisecond)
+
+	// Step 4: Capture AFTER (as byte stream)
+	after, err := t.capturePaneFull(session)
+	if err != nil {
+		return err
+	}
+
+	// Step 5: Run Myers diff and find the nudge
+	nudgeBytes := []byte(message)
+
+	// Quick check: is the nudge even in AFTER?
+	if bytes.Index(after, nudgeBytes) < 0 {
+		return ErrNudgeNotFound
+	}
+
+	// Compute diff and find the nudge hunk
+	diffs := MyersDiff(before, after)
+	original, gapTyping, afterNudgeTyping, found := FindNudgeInDiff(before, after, nudgeBytes, diffs)
+	if !found {
+		return ErrNudgeNotFound
+	}
+
+	// Step 6: Verify clean delivery
+	if !IsCleanDelivery(gapTyping, afterNudgeTyping) {
+		// User was typing during injection - caller should retry later
+		// Note: original contains what user had typed before Ctrl-C
+		// Future enhancement: could log this for debugging
+		_ = original // Currently unused, but available for restoration
+		return ErrUserTyping
+	}
+
+	// Clean delivery - send Enter
+	// Send Escape first for vim mode compatibility
+	_, _ = t.run("send-keys", "-t", session, "Escape")
+	time.Sleep(100 * time.Millisecond)
+
+	if err := t.SendKeysRaw(session, "Enter"); err != nil {
+		return err
+	}
+
+	// Future enhancement: Input restoration
+	// If original is non-empty, the user had typed something before the nudge arrived.
+	// We could restore it after the nudge is processed:
+	//   toRestore := TextToRestore(original, gapTyping, afterNudgeTyping)
+	//   if len(toRestore) > 0 { t.SendKeysLiteral(session, string(toRestore)) }
+	// For now, we just deliver the nudge cleanly.
+
+	// Wake the pane for detached sessions
+	t.WakePaneIfDetached(session)
+	return nil
 }
 
 // capturePaneFull captures the full scrollback of a pane.
@@ -181,134 +145,6 @@ func (t *Tmux) capturePaneFull(session string) ([]byte, error) {
 		return nil, err
 	}
 	return []byte(content), nil
-}
-
-// capturePaneTail captures the last N lines of a pane.
-func (t *Tmux) capturePaneTail(session string, lines int) ([]byte, error) {
-	content, err := t.CapturePane(session, lines)
-	if err != nil {
-		return nil, err
-	}
-	return []byte(content), nil
-}
-
-// restoreInput sends preserved input back to the session.
-func (t *Tmux) restoreInput(session string, preserved *preservedInput) {
-	combined := preserved.combined()
-	if len(combined) == 0 {
-		return
-	}
-	// Send the preserved text back (without Enter)
-	_ = t.SendKeysLiteral(session, string(combined))
-}
-
-// waitForTypingLull waits for a pause in user typing.
-// Returns true if a lull was detected, false if typing continues.
-func (t *Tmux) waitForTypingLull(session string, duration time.Duration) bool {
-	start := time.Now()
-	lastCapture, _ := t.capturePaneTail(session, 5)
-
-	for time.Since(start) < duration {
-		time.Sleep(50 * time.Millisecond)
-		current, err := t.capturePaneTail(session, 5)
-		if err != nil {
-			continue
-		}
-		if !bytes.Equal(current, lastCapture) {
-			// Content changed - typing continues, reset timer
-			lastCapture = current
-			start = time.Now()
-		}
-	}
-
-	// Lull detected - no change for duration
-	return true
-}
-
-// verifyNudgeIntegrity checks if the nudge arrived intact and detects extra text.
-// Returns: found, textBefore, textAfter, corrupted
-func verifyNudgeIntegrity(afterTail []byte, nudgeMessage string) (bool, []byte, []byte, bool) {
-	lines := tailLines(afterTail, nudgeTailCaptureLines)
-	if len(lines) == 0 {
-		return false, nil, nil, false
-	}
-
-	// Find the line containing our nudge
-	nudgeBytes := []byte(nudgeMessage)
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := lines[i]
-		idx := bytes.Index(line, nudgeBytes)
-		if idx == -1 {
-			continue
-		}
-
-		// Found nudge - check for extra text
-		textBefore := bytes.TrimSpace(line[:idx])
-		textAfter := bytes.TrimSpace(line[idx+len(nudgeBytes):])
-
-		// Check if nudge is intact (not corrupted)
-		// A corrupted nudge would have characters inserted into the middle
-		// For now, if we found the exact message, it's not corrupted
-		corrupted := false
-
-		return true, textBefore, textAfter, corrupted
-	}
-
-	return false, nil, nil, false
-}
-
-// findOriginalInput locates the original input in the BEFORE capture using context matching.
-func findOriginalInput(beforeFull, afterTail []byte, nudgeMessage string) []byte {
-	// Get context lines before the nudge in AFTER
-	afterLines := splitLines(afterTail)
-	nudgeBytes := []byte(nudgeMessage)
-
-	// Find nudge position in AFTER
-	nudgeLineIdx := -1
-	for i := len(afterLines) - 1; i >= 0; i-- {
-		if bytes.Contains(afterLines[i], nudgeBytes) {
-			nudgeLineIdx = i
-			break
-		}
-	}
-
-	if nudgeLineIdx < 0 {
-		return nil
-	}
-
-	// Get context lines before the nudge (up to nudgeContextLines)
-	contextStart := nudgeLineIdx - nudgeContextLines
-	if contextStart < 0 {
-		contextStart = 0
-	}
-	context := afterLines[contextStart:nudgeLineIdx]
-	if len(context) == 0 {
-		return nil
-	}
-
-	// Search for this context in BEFORE
-	beforeLines := splitLines(beforeFull)
-
-	// Search from the end (most likely location)
-	for i := len(beforeLines) - 1; i >= len(context); i-- {
-		// Check if context matches
-		match := true
-		for j := 0; j < len(context); j++ {
-			if !linesMatch(beforeLines[i-len(context)+j], context[j]) {
-				match = false
-				break
-			}
-		}
-		if match {
-			// The line after context in BEFORE is the original input
-			if i < len(beforeLines) {
-				return bytes.TrimSpace(beforeLines[i])
-			}
-			break
-		}
-	}
-
-	return nil
 }
 
 // tailLines extracts the last n lines from data efficiently.
@@ -347,19 +183,6 @@ func tailLines(data []byte, n int) [][]byte {
 	return lines
 }
 
-// splitLines splits data into lines.
-func splitLines(data []byte) [][]byte {
-	if len(data) == 0 {
-		return nil
-	}
-	return bytes.Split(data, []byte{'\n'})
-}
-
-// linesMatch compares two lines ignoring trailing whitespace.
-func linesMatch(a, b []byte) bool {
-	return bytes.Equal(bytes.TrimRight(a, " \t\r"), bytes.TrimRight(b, " \t\r"))
-}
-
 // hasPastedTextPlaceholder checks if the capture contains a large paste placeholder.
 // Scans the last maxLines lines for the placeholder pattern.
 func hasPastedTextPlaceholder(data []byte, maxLines int) bool {
@@ -371,3 +194,5 @@ func hasPastedTextPlaceholder(data []byte, maxLines int) bool {
 	}
 	return false
 }
+
+
