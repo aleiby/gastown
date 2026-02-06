@@ -46,8 +46,9 @@ The previous design used Ctrl-C to clear input. This has fundamental problems:
 - Home goes to beginning of **current visual line only**, not beginning of entire multi-line input
 - Ctrl-K kills to end of **current visual line only** — no "kill to end of buffer" equivalent
 - Atomic batching (multiple keys in one tmux send-keys call) does not work — the TUI needs separate calls with ~50ms delay between them
-- Up arrow navigates command history, not input lines
+- Up/Down arrows navigate within multi-line input but also enter command history at boundaries
 - Ctrl-Home, Ctrl-End, Shift-selection combos are not supported in ink-based TUIs
+- Cursor may be on any line of multi-line input, not necessarily the bottom line
 
 ### Protocol Flow
 
@@ -74,12 +75,13 @@ The previous design used Ctrl-C to clear input. This has fundamental problems:
 └────────────────────────┬────────────────────────────────────────────────┘
                          ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  CLEAR (convergence loop)                                               │
-│  prev = captureLast(N)                                                  │
+│  CLEAR + COLLECT (convergence loop)                                     │
+│  prev = captureLast(N+2)   (+2 for visibility above sentinel)          │
 │  loop (max 30 iterations):                                              │
 │    Home + Ctrl-K                                                        │
 │    wait 50ms                                                            │
-│    cur = captureLast(N)                                                  │
+│    cur = captureLast(N+2)                                                │
+│    collect disappeared line content (see Input Restoration)             │
 │    if cur == prev → break (converged, input is clear)                   │
 │    if len(cur) > len(prev) + threshold → abort (external input)         │
 │    prev = cur                                                           │
@@ -93,10 +95,10 @@ The previous design used Ctrl-C to clear input. This has fundamental problems:
 └────────────────────────┬────────────────────────────────────────────────┘
                          ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  (Future) RESTORE original user input                                   │
-│  The original input is known from the initial full capture              │
-│  (everything on the sentinel's line after the sentinel)                 │
-│  plus content on preceding input lines.                                 │
+│  RESTORE original user input                                            │
+│  Original input was collected during CLEAR phase                        │
+│  Inject via send-keys -l after agent finishes processing nudge          │
+│  (Requires coordination to detect agent completion — future work)       │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -195,20 +197,97 @@ if len(cur) > len(prev) + 50 {
 | Copy mode | `#{pane_in_mode} == 1` | Defer to next cycle |
 | Large paste placeholder | `[Pasted text #N +X lines]` in last 50 lines | Defer |
 | User typing during clear | Capture grows between iterations | Abort, daemon retries |
-| User pressing Up/Down | Content changes dramatically (history nav) | Abort, daemon retries |
+| User navigating input | Content changes between captures | Abort, daemon retries |
+| Cursor mid-input | Sentinel on interior line, input above and below | Deletion tracking captures all directions |
 | Empty input (common case) | Sentinel cleared in 1 iter, convergence in 2 | Fast path: ~230ms total |
 | Sentinel not found | Not in capture | Return ErrSentinelNotFound |
 | Input field at terminal width | Sentinel inserted after Home (line start) | No wrap possible |
 | Agent output during clear | Output is above capture window (N lines from bottom) | Not visible in convergence captures |
 | Vim mode enabled | Ctrl-K is a digraph key in insert mode | Needs detection/alternate path (future) |
 
-## Input Restoration (Future)
+## Input Restoration via Deletion Tracking
 
-The initial full capture contains the user's original input. After the sentinel is found, everything on the sentinel's line **after** the sentinel is the bottom line of the user's input. Lines above (between the previous separator and the sentinel line) are the preceding input lines.
+### Key Insight
 
-Because Home only reaches the current (bottom) visual line, and there is no keystroke that navigates to the beginning of multi-line input in Claude Code's ink TUI, the original input must be extracted from the capture data.
+The convergence loop already compares consecutive captures. By observing what **disappears** between iterations, we reconstruct the original input as a side effect of clearing — no separate diff algorithm or format-specific parsing needed.
 
-After the nudge is delivered and the agent processes it, the original input can be restored via `send-keys -l`. This requires knowing when the agent has finished processing — a separate coordination problem left for future work.
+### How It Works
+
+Each Home+Ctrl-K iteration removes one visual line of content. By comparing `prev` and `cur` captures, the line present in `prev` but absent in `cur` is the content that was just cleared. Collect these lines during the convergence loop to reconstruct the full original input.
+
+### Capture Window: N+2
+
+The convergence capture uses `N+2` lines instead of `N` (where N = lines from sentinel to bottom). The extra lines provide visibility into input lines **above** the sentinel that haven't entered the clearing zone yet. As lines are cleared and the TUI redraws, content from above scrolls into the capture window. The +2 ensures we see each line before it gets cleared, making the comparison more reliable.
+
+### Cursor Position: Mid-Input
+
+The cursor can be on **any line** of multi-line input, not just the bottom. Arrow keys navigate within multi-line input in Claude Code and other TUIs. This means the sentinel may land on an interior line, with input both above and below it.
+
+```
+Line 1 of input
+§XXXX§Line 2 of input        ← sentinel (cursor was here)
+Line 3 of input
+```
+
+As clearing progresses, lines both above and below the sentinel get cleared. The deletion-tracking approach captures all of them regardless of direction — whatever disappears between captures is collected.
+
+### Reconstruction
+
+The initial full capture provides the sentinel's position. From this we know:
+- **Sentinel line content**: everything after `§XXXX§` on the sentinel line
+- **Lines below sentinel**: visible in the initial capture between the sentinel line and non-input content (separator/status)
+
+During clearing, lines are collected in the order they're cleared (starting from the sentinel line, then expanding outward as lines collapse). The initial full capture provides the ordering context needed to reconstruct the original multi-line input in the correct order.
+
+```go
+func clearAndCollect(captureN int, sentinel string) (originalInput string, err error) {
+    var deletedLines []string
+    windowN := captureN + 2
+    prev := captureLast(windowN)
+
+    for i := 0; i < maxIters; i++ {
+        sendKeys("Home")
+        sendKeys("C-k")
+        time.Sleep(50 * time.Millisecond)
+
+        cur := captureLast(windowN)
+        if cur == prev {
+            break // converged
+        }
+
+        // Safety: abort if capture grew (external input)
+        if len(cur) > len(prev) + 50 {
+            return "", ErrExternalInput
+        }
+
+        // Find content that disappeared between captures
+        deleted := findDisappeared(prev, cur)
+        if deleted != "" {
+            deletedLines = append(deletedLines, deleted)
+        }
+
+        prev = cur
+    }
+
+    // Strip sentinel from the first collected line
+    if len(deletedLines) > 0 {
+        deletedLines[0] = strings.TrimPrefix(deletedLines[0], sentinel)
+    }
+
+    // Reverse: collected bottom-to-top during clearing
+    slices.Reverse(deletedLines)
+    return strings.Join(deletedLines, "\n"), nil
+}
+```
+
+### Restoration Delivery
+
+After the nudge is delivered and the agent processes it, the collected input can be restored via `send-keys -l`. This requires knowing when the agent has finished processing the nudge — a coordination problem that can be solved by waiting for the agent's response to appear in the capture, or by deferring restoration to the next daemon cycle.
+
+### Open Questions
+
+- **Clearing direction**: When the cursor is mid-input, does clearing proceed upward, downward, or from the cursor line outward? Needs testing to verify line ordering during collection.
+- **Line wrapping**: If a single logical input line wraps across two visual lines, the two visual lines would be collected separately. Joining them requires detecting wrap boundaries (lines without trailing newlines in the original input).
 
 ## Timing
 
@@ -289,8 +368,8 @@ All atomic strategies (multiple keys in one `tmux send-keys` call) failed 100%. 
 | Home | Beginning of current visual line | Yes (per-line positioning) |
 | Ctrl-A | Same as Home | No advantage |
 | End | End of current visual line | Not needed |
-| Up | Command history navigation | No (leaves input field) |
-| Down | Command history navigation | No (leaves input field) |
+| Up | Navigates within multi-line input; history at top boundary | Not for clearing |
+| Down | Navigates within multi-line input; history at bottom boundary | Not for clearing |
 | Ctrl-Home | Inconsistent behavior | No |
 | Ctrl-End | Not supported | No |
 | Shift-End/Home | Partial selection, unreliable | No |
