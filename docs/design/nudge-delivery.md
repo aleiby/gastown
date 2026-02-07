@@ -20,7 +20,7 @@ Nudges need to be 100% reliable with low latency (max handful of seconds), but t
 
 The protocol separates two independent problems:
 
-1. **Clearing**: Remove whatever is in the input field. Uses Home+Ctrl-K convergence — simple, fast, proven reliable. No sentinel needed.
+1. **Clearing**: Remove whatever is in the input field. Uses C-a+Ctrl-K convergence — simple, fast, proven reliable. No sentinel needed.
 2. **Content capture**: Identify what was in the input field before clearing, for later restoration. Uses Myers diff on before/after full captures — preserves formatting, handles empty lines, already implemented.
 
 This separation avoids the complications of trying to capture content during clearing (sentinel-per-line word wrap issues, empty line boundary detection ambiguity).
@@ -36,17 +36,19 @@ The previous design used Ctrl-C to clear input. This has fundamental problems:
 3. **Space-prefix failure**: The `space + Ctrl-C` safety pattern doesn't clear large collapsed paste blocks (`[Pasted text #N +X lines]`).
 4. **Input restoration impossible**: After Ctrl-C clears input, restoring it requires a second Ctrl-C to clear the garbled state — which risks the double-Ctrl-C exit.
 
-### Why Home+Ctrl-K?
+### Why C-a+Ctrl-K?
 
 **Tested extensively** (see Appendix A):
-- **Home**: Goes to beginning of current visual line (no signal, no side effects)
+- **C-a**: Goes to beginning of current visual line (no signal, no side effects)
 - **Ctrl-K**: Kills from cursor to end of visual line (no signal, no side effects)
-- Each Home+Ctrl-K pair clears one visual line
-- Extra Home+Ctrl-K on an empty input field is a no-op (safe to overshoot)
+- Each C-a+Ctrl-K pair clears one visual line
+- Extra C-a+Ctrl-K on an empty input field is a no-op (safe to overshoot)
 - No risk of agent interruption, session exit, or signal interference
 
+**Why C-a over Home**: C-a is the readline/emacs convention for "beginning of line" and works reliably across all CLI agents. Home depends on terminal escape sequences (`\e[H`, `\e[1~`) which vary by terminal emulator and can be intercepted or misinterpreted. Since we send keys via `tmux send-keys`, C-a is delivered as the raw control character — no escape sequence ambiguity. See **Cross-Agent Compatibility** section below for details.
+
 **Limitations discovered through testing:**
-- Home goes to beginning of **current visual line only**, not beginning of entire multi-line input
+- C-a goes to beginning of **current visual line only**, not beginning of entire multi-line input
 - Ctrl-K kills to end of **current visual line only** — no "kill to end of buffer" equivalent
 - Atomic batching (multiple keys in one tmux send-keys call) does not work — the TUI needs separate calls with ~50ms delay between them
 - Up/Down arrows navigate within multi-line input but also enter command history at boundaries
@@ -64,7 +66,7 @@ The previous design used Ctrl-C to clear input. This has fundamental problems:
                          ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  SENTINEL + CAPTURE BEFORE                                              │
-│  1. Home (go to beginning of current line)                              │
+│  1. C-a (go to beginning of current line)                               │
 │  2. Insert sentinel: §XXXX§ (4-char hash + bookends, 6 chars total)    │
 │  3. Wait 50ms for TUI to render                                        │
 │  4. Full capture (tmux capture-pane -p -S -)                            │
@@ -75,7 +77,7 @@ The previous design used Ctrl-C to clear input. This has fundamental problems:
 │  CLEAR (convergence loop)                                               │
 │  prev = captureLast(N+2)                                                │
 │  loop (max 30 iterations):                                              │
-│    Home + Ctrl-K                                                        │
+│    C-a + Ctrl-K                                                         │
 │    wait 50ms                                                            │
 │    cur = captureLast(N+2)                                                │
 │    if cur == prev → break (converged, input is clear)                   │
@@ -135,13 +137,13 @@ func makeSentinel() string {
 }
 ```
 
-### Why Insert After Home?
+### Why Insert After C-a?
 
-The sentinel is inserted **after** sending Home, which places it at the beginning of the current visual line. This prevents a line-wrap edge case:
+The sentinel is inserted **after** sending C-a, which places it at the beginning of the current visual line. This prevents a line-wrap edge case:
 
 If inserted at the cursor position (end of input), a long line near the terminal width could wrap when the sentinel is appended. `tmux capture-pane` outputs visual lines with newlines at wrap boundaries, which would split the sentinel across two lines and break detection.
 
-Inserting after Home guarantees the sentinel is at the **start** of a visual line, where wrapping cannot occur (nothing precedes it on that line).
+Inserting after C-a guarantees the sentinel is at the **start** of a visual line, where wrapping cannot occur (nothing precedes it on that line).
 
 ### Finding the Sentinel
 
@@ -161,27 +163,27 @@ func findSentinelFromEnd(capture, sentinel string) (lineIdx, linesFromBottom int
 
 ### Sentinel Lifecycle
 
-1. Inserted once before the initial full capture (Home + sentinel)
+1. Inserted once before the initial full capture (C-a + sentinel)
 2. Found in the capture to establish cursor line position and compute N
-3. Cleared naturally by the first Home+Ctrl-K iteration (it's at the beginning of the line being cleared)
+3. Cleared naturally by the first C-a+Ctrl-K iteration (it's at the beginning of the line being cleared)
 4. No cleanup step needed — the convergence loop removes it
 
 ## Convergence Detection (Clearing)
 
 ### How It Works
 
-After each Home+Ctrl-K, capture the last N+2 lines of the pane (where N was determined by the sentinel position, +2 for margin). Compare with the previous capture byte-for-byte. When the capture stops changing, clearing is complete.
+After each C-a+Ctrl-K, capture the last N+2 lines of the pane (where N was determined by the sentinel position, +2 for margin). Compare with the previous capture byte-for-byte. When the capture stops changing, clearing is complete.
 
 ### Why Convergence Works
 
-- Each Home+Ctrl-K removes content from the input area, changing the capture
-- When nothing remains to clear, Home+Ctrl-K is a no-op and the capture is unchanged
+- Each C-a+Ctrl-K removes content from the input area, changing the capture
+- When nothing remains to clear, C-a+Ctrl-K is a no-op and the capture is unchanged
 - The capture window (last N+2 lines) is isolated from agent output changes above the input field
 - No format-specific parsing needed — pure byte comparison
 
 ### Clearing Mechanics (Tested)
 
-Each input line requires **2 Home+Ctrl-K iterations**: one kills the text content, one kills the newline. For M lines of input, expect 2M iterations before convergence, plus 1 final iteration to confirm.
+Each input line requires **2 C-a+Ctrl-K iterations**: one kills the text content, one kills the newline. For M lines of input, expect 2M iterations before convergence, plus 1 final iteration to confirm.
 
 | Input Lines | Iterations to Converge | Duration (50ms delay) |
 |------------|----------------------|----------------------|
@@ -205,12 +207,12 @@ if len(cur) > len(prev) + 50 {
 
 ### Why Diff?
 
-After clearing, we need to know what was in the input field to restore it later. The clearing process is intentionally simple (just Home+Ctrl-K convergence) and doesn't track content. Instead, we take full captures **before** and **after** clearing and diff them.
+After clearing, we need to know what was in the input field to restore it later. The clearing process is intentionally simple (just C-a+Ctrl-K convergence) and doesn't track content. Instead, we take full captures **before** and **after** clearing and diff them.
 
 ### Why Myers Diff Works Here
 
-With Home+Ctrl-K clearing (unlike Ctrl-C), the before/after captures have clean differences:
-- **No "Interrupted" messages** — Home+Ctrl-K sends no signals
+With C-a+Ctrl-K clearing (unlike Ctrl-C), the before/after captures have clean differences:
+- **No "Interrupted" messages** — C-a+Ctrl-K sends no signals
 - **No agent state changes** — no SIGINT means the agent keeps its current state
 - **Minimal noise** — only the input area changes, plus possible status bar updates and agent output during the ~1s clearing window
 
@@ -245,7 +247,7 @@ The TUI formatting prefix needs to be stripped from the deleted content to recov
 
 ### Open Questions
 
-- **How reliably does Myers diff isolate the input?** Needs testing with real before/after captures from the Home+Ctrl-K clearing process to verify clean hunk boundaries.
+- **How reliably does Myers diff isolate the input?** Needs testing with real before/after captures from the C-a+Ctrl-K clearing process to verify clean hunk boundaries.
 - **TUI prefix stripping**: How much formatting does the TUI add to input lines? Is it consistent enough to strip mechanically, or does it vary by line position?
 - **Agent output during clearing**: If the agent produces output during the ~1s clearing window, it appears as inserted content in the diff. Does this interfere with identifying the deleted input?
 
@@ -256,20 +258,49 @@ The TUI formatting prefix needs to be stripped from the deleted content to recov
 | Copy mode | `#{pane_in_mode} == 1` | Defer to next cycle |
 | Large paste placeholder | `[Pasted text #N +X lines]` in last 50 lines | Defer |
 | User typing during clear | Capture grows between convergence iterations | Abort, daemon retries |
-| Cursor mid-input | Sentinel on interior line | Convergence clears all lines regardless of cursor position |
+| Cursor mid-input | Sentinel on interior line | Convergence clears all lines regardless of initial cursor position |
 | Empty input (common case) | Sentinel cleared in 1 iter, convergence in 2 | Fast path: ~230ms total |
 | Empty lines in input | Part of the deleted region in diff | Captured naturally by Myers diff |
 | Sentinel not found | Not in capture | Return ErrSentinelNotFound |
-| Input field at terminal width | Sentinel inserted after Home (line start) | No wrap possible |
+| Input field at terminal width | Sentinel inserted after C-a (line start) | No wrap possible |
 | Agent output during clear | Appears as inserted content in diff | Separate hunk from deleted input |
 | Vim mode enabled | Ctrl-K is a digraph key in insert mode | Needs detection/alternate path (future) |
+
+## Cross-Agent Compatibility
+
+### Why C-a Over Home
+
+The protocol uses C-a (Ctrl-A) rather than Home for "go to beginning of line". Both work identically in Claude Code, but C-a is the better choice for cross-agent portability:
+
+| Factor | C-a | Home |
+|--------|-----|------|
+| Delivery mechanism | Raw control character (0x01) | Terminal escape sequence (`\e[H` or `\e[1~`) |
+| readline/emacs convention | Yes (standard) | Terminal-dependent |
+| tmux send-keys | `send-keys C-a` — unambiguous | `send-keys Home` — tmux translates to escape sequence |
+| tmux prefix conflict | None — `send-keys` bypasses prefix handling | N/A |
+
+### Per-Agent Analysis
+
+**Claude Code** (ink-based TUI): C-a and Home are equivalent — both go to beginning of current visual line. C-a is the native readline binding.
+
+**Gemini CLI** (ink-based TUI): Uses readline keybindings. C-a works for beginning of line. Home behavior depends on terminal escape sequence support.
+
+**OpenCode** (Bubble Tea TUI): Distinguishes C-a (beginning of current line) from Home (beginning of input buffer). This means Home has different semantics in OpenCode — it navigates to the start of the entire multi-line input, not just the current line. For our protocol (clearing line by line), we want current-line behavior, making C-a the correct choice.
+
+**Codex CLI** (ink-based TUI): Home key has known environment-sensitive issues — GitHub issue reports of Home not working correctly in certain terminal configurations. C-a avoids these escape sequence problems entirely.
+
+**Amp** (Bubble Tea TUI): Ctrl+K is sometimes intercepted by IDE integrations (VS Code terminal). C-a is less likely to be intercepted since it's a basic readline binding rather than a "kill" command that IDEs might capture.
+
+### tmux send-keys and C-a
+
+A common concern: if the user's tmux prefix is C-a (the default), doesn't `send-keys C-a` trigger the prefix? No — `tmux send-keys` explicitly sends the key to the target pane, bypassing prefix handling. The prefix key is only intercepted when the user physically presses it in that terminal. Programmatic `send-keys` always delivers to the pane.
 
 ## Timing
 
 | Constant | Value | Purpose |
 |----------|-------|---------|
 | `sentinelInsertDelay` | 50ms | Wait after sentinel insertion for TUI to render |
-| `clearIterDelay` | 50ms | Wait after each Home+Ctrl-K for TUI to render |
+| `clearIterDelay` | 50ms | Wait after each C-a+Ctrl-K for TUI to render |
 | `nudgeInjectDelay` | 50ms | Wait after injecting nudge text before Enter |
 
 **Protocol overhead**: ~70ms fixed (sentinel + captures) + ~60ms per input line cleared + diff computation (negligible for typical capture sizes).
@@ -280,7 +311,7 @@ The TUI formatting prefix needs to be stripped from the deleted content to recov
 
 See "Why Not Ctrl-C?" above. The Ctrl-C approach was implemented with a Myers diff verification algorithm. While the diff algorithm worked well for detecting gap typing and after-nudge typing, the fundamental Ctrl-C problems (agent interruption, exit risk, restoration impossibility) made it unsuitable.
 
-The current design retains Myers diff for content capture but replaces Ctrl-C with Home+Ctrl-K for clearing.
+The current design retains Myers diff for content capture but replaces Ctrl-C with C-a+Ctrl-K for clearing.
 
 ### Sentinel-Per-Line Content Collection
 
@@ -343,7 +374,7 @@ Testing was performed against a live Claude Code session (`gt-gastown-crew-amos`
 
 | Strategy | Ops | Duration | Success Rate |
 |----------|-----|----------|-------------|
-| **Home + Ctrl-K per line** | **15** | **258ms** | **3/3** |
+| **C-a + Ctrl-K per line** | **15** | **258ms** | **3/3** |
 | Ctrl-U fast (no delay) | 270 | 598ms | 3/3 |
 | Ctrl-U slow (30ms delay) | 250 | 1.75s | 3/3 |
 | End + Ctrl-U | 390-540 | 1.18-1.35s | 1/3 |
@@ -357,8 +388,8 @@ All atomic strategies (multiple keys in one `tmux send-keys` call) failed 100%. 
 
 | Key | Behavior | Useful for clearing? |
 |-----|----------|---------------------|
-| Home | Beginning of current visual line | Yes (per-line positioning) |
-| Ctrl-A | Same as Home | No advantage |
+| C-a | Beginning of current visual line | **Yes** (primary choice, cross-agent compatible) |
+| Home | Beginning of current visual line | Equivalent in Claude Code, but less portable |
 | End | End of current visual line | Not needed |
 | Up | Navigates within multi-line input; history at top boundary | Not for clearing |
 | Down | Navigates within multi-line input; history at bottom boundary | Not for clearing |
@@ -366,7 +397,7 @@ All atomic strategies (multiple keys in one `tmux send-keys` call) failed 100%. 
 | Ctrl-End | Not supported | No |
 | Shift-End/Home | Partial selection, unreliable | No |
 
-### Home+Ctrl-K Tuning (10-line input)
+### C-a+Ctrl-K Tuning (10-line input)
 
 | Delay | Iterations | Duration | Success |
 |-------|-----------|----------|---------|
