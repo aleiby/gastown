@@ -266,7 +266,7 @@ func (t *Tmux) nudgeWithProtocol(session, message string) error {
 	}
 
 	// Clear input, get BEFORE capture
-	beforeCapture, sentinel, captureN, err := t.clearInput(session)
+	beforeCapture, sentinel, _, err := t.clearInput(session)
 	if err != nil {
 		return fmt.Errorf("nudge: %w", err)
 	}
@@ -278,39 +278,22 @@ func (t *Tmux) nudgeWithProtocol(session, message string) error {
 	}
 	originalInput := extractOriginalInput(beforeCapture, afterCapture, sentinel)
 
-	// Inject + verify + restore (up to 3 attempts)
-	for attempt := 0; attempt < nudgeMaxRetries; attempt++ {
-		// Inject nudge
-		if err := t.SendKeysLiteral(session, message); err != nil {
-			return fmt.Errorf("nudge: inject: %w", err)
-		}
-		time.Sleep(nudgeInjectDelayMs * time.Millisecond)
+	// Inject nudge + Enter
+	if err := t.SendKeysLiteral(session, message); err != nil {
+		return fmt.Errorf("nudge: inject: %w", err)
+	}
+	time.Sleep(nudgeInjectDelayMs * time.Millisecond)
 
-		if err := t.SendKeysRaw(session, "Enter"); err != nil {
-			return fmt.Errorf("nudge: enter: %w", err)
-		}
-		time.Sleep(nudgeEnterDelayMs * time.Millisecond)
-
-		// Verify via convergence probe
-		if t.probeInputEmpty(session, captureN) {
-			// Nudge submitted — restore original input
-			if originalInput != "" {
-				_ = t.SendKeysLiteral(session, originalInput)
-			}
-			t.WakePaneIfDetached(session)
-			return nil
-		}
-
-		// Probe found stuck text and started clearing — finish clearing
-		if err := t.convergenceClear(session, captureN); err != nil {
-			// If clear stalls, don't keep retrying
-			break
-		}
+	if err := t.SendKeysRaw(session, "Enter"); err != nil {
+		return fmt.Errorf("nudge: enter: %w", err)
 	}
 
-	// Delivery failed — restore original input, return error
+	// Restore original input
 	if originalInput != "" {
+		time.Sleep(nudgeEnterDelayMs * time.Millisecond)
 		_ = t.SendKeysLiteral(session, originalInput)
 	}
-	return ErrNudgeDeliveryFailed
+
+	t.WakePaneIfDetached(session)
+	return nil
 }
