@@ -640,6 +640,14 @@ func (t *Tmux) SendKeysRaw(session, keys string) error {
 	return err
 }
 
+// SendKeysLiteral sends text to a session in literal mode without Enter.
+// Literal mode (-l) treats all characters as literal text, not key names.
+// Use this for injecting text that may contain special characters.
+func (t *Tmux) SendKeysLiteral(session, text string) error {
+	_, err := t.run("send-keys", "-t", session, "-l", text)
+	return err
+}
+
 // SendKeysReplace sends keystrokes, clearing any pending input first.
 // This is useful for "replaceable" notifications where only the latest matters.
 // Uses Ctrl-U to clear the input line before sending the new message.
@@ -720,9 +728,18 @@ func (t *Tmux) WakePaneIfDetached(target string) {
 
 // NudgeSession sends a message to a Claude Code session reliably.
 // This is the canonical way to send messages to Claude sessions.
-// Uses: literal mode + 500ms debounce + ESC (for vim mode) + separate Enter.
+//
+// Uses the C-a + Ctrl-K Clear/Inject/Verify/Restore protocol:
+// 1. Pre-checks (copy mode, paste placeholder)
+// 2. Inserts sentinel, captures BEFORE state
+// 3. Clears input via convergence loop (C-a + Ctrl-K until stable)
+// 4. Captures AFTER state, diffs to extract original input
+// 5. Injects nudge text + Enter
+// 6. Verifies delivery via convergence probe
+// 7. Restores original input if any
+//
+// This preserves user input when nudges arrive while the user is typing.
 // After sending, triggers SIGWINCH to wake Claude in detached sessions.
-// Verification is the Witness's job (AI), not this function.
 //
 // IMPORTANT: Nudges to the same session are serialized to prevent interleaving.
 // If multiple goroutines try to nudge the same session concurrently, they will
@@ -734,38 +751,12 @@ func (t *Tmux) NudgeSession(session, message string) error {
 	lock.Lock()
 	defer lock.Unlock()
 
-	// 1. Send text in literal mode (handles special characters)
-	if _, err := t.run("send-keys", "-t", session, "-l", message); err != nil {
-		return err
-	}
-
-	// 2. Wait 500ms for paste to complete (tested, required)
-	time.Sleep(500 * time.Millisecond)
-
-	// 3. Send Escape to exit vim INSERT mode if enabled (harmless in normal mode)
-	// See: https://github.com/anthropics/gastown/issues/307
-	_, _ = t.run("send-keys", "-t", session, "Escape")
-	time.Sleep(100 * time.Millisecond)
-
-	// 4. Send Enter with retry (critical for message submission)
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 {
-			time.Sleep(200 * time.Millisecond)
-		}
-		if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
-			lastErr = err
-			continue
-		}
-		// 5. Wake the pane to trigger SIGWINCH for detached sessions
-		t.WakePaneIfDetached(session)
-		return nil
-	}
-	return fmt.Errorf("failed to send Enter after 3 attempts: %w", lastErr)
+	return t.nudgeWithProtocol(session, message)
 }
 
 // NudgePane sends a message to a specific pane reliably.
 // Same pattern as NudgeSession but targets a pane ID (e.g., "%9") instead of session name.
+// Uses the C-a + Ctrl-K Clear/Inject/Verify/Restore protocol to preserve user input.
 // After sending, triggers SIGWINCH to wake Claude in detached sessions.
 // Nudges to the same pane are serialized to prevent interleaving.
 func (t *Tmux) NudgePane(pane, message string) error {
@@ -774,34 +765,9 @@ func (t *Tmux) NudgePane(pane, message string) error {
 	lock.Lock()
 	defer lock.Unlock()
 
-	// 1. Send text in literal mode (handles special characters)
-	if _, err := t.run("send-keys", "-t", pane, "-l", message); err != nil {
-		return err
-	}
-
-	// 2. Wait 500ms for paste to complete (tested, required)
-	time.Sleep(500 * time.Millisecond)
-
-	// 3. Send Escape to exit vim INSERT mode if enabled (harmless in normal mode)
-	// See: https://github.com/anthropics/gastown/issues/307
-	_, _ = t.run("send-keys", "-t", pane, "Escape")
-	time.Sleep(100 * time.Millisecond)
-
-	// 4. Send Enter with retry (critical for message submission)
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 {
-			time.Sleep(200 * time.Millisecond)
-		}
-		if _, err := t.run("send-keys", "-t", pane, "Enter"); err != nil {
-			lastErr = err
-			continue
-		}
-		// 5. Wake the pane to trigger SIGWINCH for detached sessions
-		t.WakePaneIfDetached(pane)
-		return nil
-	}
-	return fmt.Errorf("failed to send Enter after 3 attempts: %w", lastErr)
+	// Use the same reliable protocol as NudgeSession
+	// (pane IDs work with tmux commands just like session names)
+	return t.nudgeWithProtocol(pane, message)
 }
 
 // AcceptBypassPermissionsWarning dismisses the Claude Code bypass permissions warning dialog.
