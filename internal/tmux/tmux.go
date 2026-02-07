@@ -642,7 +642,13 @@ func (t *Tmux) SendKeysRaw(session, keys string) error {
 // SendKeysLiteral sends text to a session in literal mode without Enter.
 // Literal mode (-l) treats all characters as literal text, not key names.
 // Use this for injecting text that may contain special characters.
+//
+// Escapes trailing semicolons which tmux's command parser would otherwise
+// consume as command separators (even when passed via exec.Command argv).
 func (t *Tmux) SendKeysLiteral(session, text string) error {
+	if strings.HasSuffix(text, ";") {
+		text = text[:len(text)-1] + `\;`
+	}
 	_, err := t.run("send-keys", "-t", session, "-l", text)
 	return err
 }

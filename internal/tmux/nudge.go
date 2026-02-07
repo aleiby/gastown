@@ -1,13 +1,14 @@
 package tmux
 
 import (
-	"crypto/sha256"
-	"encoding/base32"
 	"errors"
 	"fmt"
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"github.com/mattn/go-runewidth"
 )
 
 // Nudge delivery errors.
@@ -20,9 +21,6 @@ var (
 
 // Timing constants for the Clear/Inject/Restore protocol.
 const (
-	// nudgeSentinelDelayMs is the time to wait after inserting sentinel for TUI to render.
-	nudgeSentinelDelayMs = 50
-
 	// nudgeClearIterDelayMs is the time to wait after each C-a+Ctrl-K for TUI to render.
 	nudgeClearIterDelayMs = 50
 
@@ -36,36 +34,27 @@ const (
 	nudgePastePlaceholderLines = 50
 
 	// nudgeMaxClearIterations is the hard upper bound on convergence loop iterations.
-	// Each input line takes ~2 iterations (content + newline), so 100 supports ~50 lines.
-	nudgeMaxClearIterations = 100
+	// Each input line takes ~2 iterations (content + newline), so 200 supports ~100 lines.
+	nudgeMaxClearIterations = 200
+
+	// nudgeMinCaptureN is the minimum number of lines to capture for convergence.
+	nudgeMinCaptureN = 5
 )
+
+// tuiSeparatorPrefix is the prefix of Claude Code's TUI separator lines.
+// Separator lines consist of box-drawing characters (U+2500) spanning the pane width.
+const tuiSeparatorPrefix = "─────"
+
+// tuiPromptPrefix is Claude Code's TUI prompt prefix: ❯ + NO-BREAK SPACE.
+const tuiPromptPrefix = "❯\u00a0"
+
+// tuiContinuationPrefix is the prefix Claude Code adds to continuation lines
+// in multi-line input — both explicit newlines AND visual line wrapping.
+const tuiContinuationPrefix = "  "
 
 // pastedTextPlaceholderRe matches Claude Code's large paste placeholder pattern.
 // Example: "[Pasted text #3 +47 lines]"
 var pastedTextPlaceholderRe = regexp.MustCompile(`\[Pasted text #\d+ \+\d+ lines\]`)
-
-// makeSentinel generates a unique sentinel string like "§XXXX§".
-// Uses sha256 of current nanosecond time, base32-encoded, 4 chars + bookends = 6 total.
-func makeSentinel() string {
-	h := sha256.Sum256([]byte(fmt.Sprintf("%d", time.Now().UnixNano())))
-	encoded := base32.StdEncoding.EncodeToString(h[:3])
-	encoded = strings.TrimRight(encoded, "=")
-	if len(encoded) > 4 {
-		encoded = encoded[:4]
-	}
-	return "§" + encoded + "§"
-}
-
-// findSentinelFromEnd searches backward through lines for the sentinel.
-// Returns the line index (from start), lines from bottom, and whether found.
-func findSentinelFromEnd(lines []string, sentinel string) (lineIdx int, linesFromBottom int, found bool) {
-	for i := len(lines) - 1; i >= 0; i-- {
-		if strings.Contains(lines[i], sentinel) {
-			return i, len(lines) - 1 - i, true
-		}
-	}
-	return 0, 0, false
-}
 
 // IsPaneInCopyMode checks if the pane is in copy mode or another blocking mode.
 func (t *Tmux) IsPaneInCopyMode(session string) bool {
@@ -82,51 +71,147 @@ func (t *Tmux) detectPastePlaceholder(session string) bool {
 	return pastedTextPlaceholderRe.MatchString(content)
 }
 
-// clearInput implements the sentinel + capture + C-a+Ctrl-K convergence clear protocol.
-//
-// Steps:
-// 1. C-a (go to beginning of current visual line)
-// 2. Insert sentinel §XXXX§
-// 3. Full capture → find sentinel → compute N (lines from sentinel to bottom)
-// 4. Convergence loop: C-a + Ctrl-K until captureLast(N+2) stabilizes
-//
-// Returns BEFORE capture (with sentinel), sentinel string, and N.
-func (t *Tmux) clearInput(session string) (beforeCapture string, sentinel string, captureN int, err error) {
-	sentinel = makeSentinel()
-
-	// Move to start of input and insert sentinel
-	if err := t.SendKeysRaw(session, "C-a"); err != nil {
-		return "", "", 0, fmt.Errorf("send C-a: %w", err)
-	}
-	if err := t.SendKeysLiteral(session, sentinel); err != nil {
-		return "", "", 0, fmt.Errorf("send sentinel: %w", err)
-	}
-	time.Sleep(nudgeSentinelDelayMs * time.Millisecond)
-
-	// Full capture to find sentinel
-	capture, err := t.CapturePaneAll(session)
-	if err != nil {
-		return "", "", 0, fmt.Errorf("capture after sentinel: %w", err)
-	}
-	beforeCapture = capture
-
-	// Find sentinel in capture
+// findInputField locates the input field in a pane capture.
+// Returns the field lines (between the last two separator lines) and the pane width.
+func findInputField(capture string) (fieldLines []string, paneWidth int, ok bool) {
 	lines := strings.Split(capture, "\n")
-	_, linesFromBottom, found := findSentinelFromEnd(lines, sentinel)
-	if !found {
-		return beforeCapture, sentinel, 2, fmt.Errorf("sentinel not found in capture")
+	var sepIndices []int
+	for i, line := range lines {
+		if strings.HasPrefix(line, tuiSeparatorPrefix) {
+			sepIndices = append(sepIndices, i)
+		}
+	}
+	if len(sepIndices) < 2 {
+		return nil, 0, false
+	}
+	topSep := sepIndices[len(sepIndices)-2]
+	botSep := sepIndices[len(sepIndices)-1]
+	// Pane width = number of ─ characters in separator (each is 1 display column)
+	paneWidth = utf8.RuneCountInString(lines[topSep])
+	return lines[topSep+1 : botSep], paneWidth, true
+}
+
+// extractOriginalInput extracts the user's original input from a pane capture.
+//
+// Locates the input field between the TUI's separator lines, strips TUI prompt
+// and continuation prefixes, then uses the pane width to distinguish visual
+// line wrapping (joined back into one logical line) from explicit newlines.
+//
+// Claude Code adds "  " prefix to ALL continuation lines — both visual wraps
+// and explicit newlines. We detect visual wraps using a word-wrap heuristic:
+// if the current line's content + space + the first word of the next line would
+// exceed availWidth, the TUI was forced to word-wrap here.
+func extractOriginalInput(capture string) string {
+	fieldLines, paneWidth, ok := findInputField(capture)
+	if !ok || len(fieldLines) == 0 {
+		return ""
 	}
 
-	// N = lines from bottom where sentinel was found
-	// Capture N+2 lines for the convergence loop (extra margin)
-	captureN = linesFromBottom + 2
+	// Claude Code uses paneWidth - 4 content chars per line:
+	// 2 columns for prompt/continuation prefix + 2 columns right margin.
+	availWidth := paneWidth - 4
 
-	// Convergence clear: C-a + Ctrl-K until captureLast(N+2) stabilizes
-	if err := t.convergenceClear(session, captureN); err != nil {
-		return beforeCapture, sentinel, captureN, err
+	// Strip TUI prefixes
+	type fieldEntry struct {
+		content string
+		width   int // display width of content
+	}
+	var entries []fieldEntry
+
+	for j, line := range fieldLines {
+		var content string
+		if j == 0 {
+			content = strings.TrimPrefix(line, tuiPromptPrefix)
+			if content == line {
+				// Try regular space variant
+				content = strings.TrimPrefix(line, "❯ ")
+			}
+			// Handle empty prompt (just "❯" with no content)
+			trimmed := strings.TrimSpace(content)
+			if trimmed == "❯" || trimmed == "\u276f" {
+				content = ""
+			}
+		} else {
+			content = strings.TrimPrefix(line, tuiContinuationPrefix)
+		}
+
+		entries = append(entries, fieldEntry{
+			content: content,
+			width:   runewidth.StringWidth(content),
+		})
 	}
 
-	return beforeCapture, sentinel, captureN, nil
+	// Reconstruct logical lines using word-wrap detection.
+	//
+	// Claude Code word-wraps: it breaks at the last space before the width
+	// limit, consuming the space. To detect this, we check if the current
+	// line's content + 1 (consumed space) + the first word of the next line
+	// would exceed availWidth. If so, the TUI was forced to wrap here.
+	//
+	// When joining wrapped lines:
+	// - Character wrap (width near availWidth): pad to availWidth to restore
+	//   any trailing spaces that tmux capture-pane trimmed.
+	// - Word wrap (width < availWidth-1): restore the single consumed space
+	//   between words.
+	var result strings.Builder
+	for j, e := range entries {
+		result.WriteString(e.content)
+		if j < len(entries)-1 {
+			if isVisualWrap(e.width, entries[j+1].content, availWidth) {
+				if e.width >= availWidth-1 {
+					// Character wrap: pad to restore tmux-trimmed trailing spaces
+					if e.width < availWidth {
+						result.WriteString(strings.Repeat(" ", availWidth-e.width))
+					}
+				} else {
+					// Word wrap: restore the consumed space between words
+					result.WriteByte(' ')
+				}
+			} else {
+				result.WriteByte('\n')
+			}
+		}
+	}
+
+	return result.String()
+}
+
+// isVisualWrap determines if the break between two field lines is a visual
+// word-wrap (should be joined) or an explicit newline (should be preserved).
+//
+// Word-wrap detection: if currentWidth + space + firstWordWidth > availWidth,
+// the TUI couldn't fit the next word and was forced to wrap.
+// Character-wrap detection: if currentWidth >= availWidth-1, the line fills
+// the full available width (the -1 accounts for tmux trimming trailing spaces).
+func isVisualWrap(currentWidth int, nextContent string, availWidth int) bool {
+	// Character wrap: line fills the available width
+	if currentWidth >= availWidth-1 {
+		return true
+	}
+
+	// Empty next line is always an explicit newline (Enter pressed twice)
+	if len(nextContent) == 0 {
+		return false
+	}
+
+	// Word-wrap: check if current content + space + first word of next line
+	// would exceed available width
+	firstWordWidth := firstWordDisplayWidth(nextContent)
+	return currentWidth+1+firstWordWidth > availWidth
+}
+
+// firstWordDisplayWidth returns the display width of the first word in content.
+// A "word" is characters up to the first space (or end of string).
+// If content starts with a space, returns 0 (indented explicit newline).
+func firstWordDisplayWidth(content string) int {
+	spaceIdx := strings.IndexByte(content, ' ')
+	if spaceIdx == 0 {
+		return 0 // starts with space — not a word-wrap continuation
+	}
+	if spaceIdx > 0 {
+		return runewidth.StringWidth(content[:spaceIdx])
+	}
+	return runewidth.StringWidth(content)
 }
 
 // convergenceClear sends C-a + Ctrl-K in a loop until the last N lines of the
@@ -182,55 +267,14 @@ func (t *Tmux) convergenceClear(session string, captureN int) error {
 	return fmt.Errorf("convergence clear exceeded %d iterations", nudgeMaxClearIterations)
 }
 
-// extractOriginalInput extracts the user's original input from the diff between
-// BEFORE (with sentinel) and AFTER (cleared) captures.
-//
-// Finds the last hunk containing the sentinel (the input region), strips the
-// sentinel and TUI prompt prefixes ("❯ " on first line, "  " on continuation).
-func extractOriginalInput(beforeCapture, afterCapture, sentinel string) string {
-	diffs := MyersDiff([]byte(beforeCapture), []byte(afterCapture))
-	hunks := GroupHunks(diffs)
-
-	// Search backward — the input is at the bottom of the capture
-	for i := len(hunks) - 1; i >= 0; i-- {
-		h := hunks[i]
-		deleted := string(h.Deleted)
-		if !strings.Contains(deleted, sentinel) {
-			continue
-		}
-
-		// Remove sentinel
-		deleted = strings.ReplaceAll(deleted, sentinel, "")
-
-		// Strip TUI prompt prefixes line by line
-		lines := strings.Split(deleted, "\n")
-		var cleaned []string
-		for j, line := range lines {
-			if j == 0 {
-				line = strings.TrimPrefix(line, "❯ ")
-			} else {
-				line = strings.TrimPrefix(line, "  ")
-			}
-			cleaned = append(cleaned, line)
-		}
-
-		result := strings.Join(cleaned, "\n")
-		result = strings.TrimSpace(result)
-		return result
-	}
-
-	return ""
-}
-
 // nudgeWithProtocol implements the Clear/Inject/Restore protocol.
 //
 // Protocol flow:
 // 1. PRE-CHECKS: Copy mode? Paste placeholder?
-// 2. SENTINEL + CAPTURE BEFORE: C-a, insert sentinel, full capture, find N
+// 2. CAPTURE BEFORE: Full capture to extract original input using TUI separators
 // 3. CLEAR: C-a + Ctrl-K convergence loop until stable
-// 4. CAPTURE AFTER + DIFF: Extract original input
-// 5. INJECT: send-keys -l message + Enter
-// 6. RESTORE: send-keys -l original input
+// 4. INJECT: send-keys -l message + Enter
+// 5. RESTORE: send-keys -l original input
 func (t *Tmux) nudgeWithProtocol(session, message string) error {
 	// Pre-checks
 	if t.IsPaneInCopyMode(session) {
@@ -240,18 +284,26 @@ func (t *Tmux) nudgeWithProtocol(session, message string) error {
 		return ErrPasteDetected
 	}
 
-	// Sentinel + capture + convergence clear
-	beforeCapture, sentinel, _, err := t.clearInput(session)
+	// Capture BEFORE state
+	beforeCapture, err := t.CapturePaneAll(session)
 	if err != nil {
-		return fmt.Errorf("nudge: %w", err)
+		return fmt.Errorf("nudge: capture before: %w", err)
 	}
 
-	// Capture AFTER state and diff to extract original input
-	afterCapture, err := t.CapturePaneAll(session)
-	if err != nil {
-		return fmt.Errorf("nudge: capture after clear: %w", err)
+	// Extract original input from BEFORE capture using separator-based extraction
+	originalInput := extractOriginalInput(beforeCapture)
+
+	// Compute captureN from field line count (+ margin for separators and status)
+	fieldLines, _, ok := findInputField(beforeCapture)
+	captureN := nudgeMinCaptureN
+	if ok && len(fieldLines)+3 > captureN {
+		captureN = len(fieldLines) + 3
 	}
-	originalInput := extractOriginalInput(beforeCapture, afterCapture, sentinel)
+
+	// Convergence clear: C-a + Ctrl-K until stable
+	if err := t.convergenceClear(session, captureN); err != nil {
+		return fmt.Errorf("nudge: %w", err)
+	}
 
 	// Inject nudge + Enter
 	if err := t.SendKeysLiteral(session, message); err != nil {
