@@ -14,13 +14,12 @@ import (
 var (
 	ErrPaneBlocked         = errors.New("pane is in copy mode or blocking state")
 	ErrPasteDetected       = errors.New("large paste placeholder detected in input")
-	ErrClearStalled        = errors.New("input clearing stalled (oscillating state detected)")
 	ErrNudgeDeliveryFailed = errors.New("nudge delivery failed after retries")
 )
 
 // Timing constants for the Clear/Inject/Verify/Restore protocol.
 const (
-	// nudgeClearDelayMs is the time to wait after C-a + Ctrl-K for clear to take effect.
+	// nudgeClearDelayMs is the time to wait after Ctrl-U for clear to take effect.
 	nudgeClearDelayMs = 50
 
 	// nudgeInjectDelayMs is the time to wait after injecting nudge text.
@@ -34,12 +33,6 @@ const (
 
 	// nudgePastePlaceholderLines is how many lines to scan for paste placeholder.
 	nudgePastePlaceholderLines = 50
-
-	// nudgeMaxClearIterations is a hard upper bound on convergence loop iterations.
-	nudgeMaxClearIterations = 100
-
-	// nudgeMaxRetries is how many times to retry inject+verify.
-	nudgeMaxRetries = 3
 )
 
 // pastedTextPlaceholderRe matches Claude Code's large paste placeholder pattern.
@@ -96,9 +89,7 @@ func (t *Tmux) clearInput(session string) (beforeCapture string, sentinel string
 	_, linesFromBottom, found := findSentinelFromEnd(lines, sentinel)
 	if !found {
 		// Sentinel not visible — clear what we can and bail
-		_ = t.SendKeysRaw(session, "C-a")
-		time.Sleep(nudgeClearDelayMs * time.Millisecond)
-		_ = t.SendKeysRaw(session, "C-k")
+		_ = t.SendKeysRaw(session, "C-u")
 		return beforeCapture, sentinel, 2, fmt.Errorf("sentinel not found in capture")
 	}
 
@@ -106,83 +97,13 @@ func (t *Tmux) clearInput(session string) (beforeCapture string, sentinel string
 	// Capture N+2 lines for the convergence loop (extra margin)
 	captureN = linesFromBottom + 2
 
-	// Now clear the input using convergence loop
-	if err := t.convergenceClear(session, captureN); err != nil {
-		return beforeCapture, sentinel, captureN, err
+	// Clear the input with Ctrl-U (clears entire input line in Claude Code TUI)
+	if err := t.SendKeysRaw(session, "C-u"); err != nil {
+		return beforeCapture, sentinel, captureN, fmt.Errorf("send C-u: %w", err)
 	}
-
-	return beforeCapture, sentinel, captureN, nil
-}
-
-// convergenceClear runs C-a + Ctrl-K in a loop until the capture stabilizes.
-// Uses cycle detection to abort if the state oscillates (e.g., vim mode).
-func (t *Tmux) convergenceClear(session string, captureN int) error {
-	// Get initial state
-	prev, err := t.capturePaneLast(session, captureN)
-	if err != nil {
-		return fmt.Errorf("initial capture: %w", err)
-	}
-
-	recentCaptures := make([]string, 0, 8)
-
-	for i := 0; i < nudgeMaxClearIterations; i++ {
-		// Send C-a (beginning of line) + Ctrl-K (kill to end of line)
-		if err := t.SendKeysRaw(session, "C-a"); err != nil {
-			return fmt.Errorf("send C-a: %w", err)
-		}
-		if err := t.SendKeysRaw(session, "C-k"); err != nil {
-			return fmt.Errorf("send C-k: %w", err)
-		}
-		time.Sleep(nudgeClearDelayMs * time.Millisecond)
-
-		cur, err := t.capturePaneLast(session, captureN)
-		if err != nil {
-			return fmt.Errorf("capture iteration %d: %w", i, err)
-		}
-
-		// Converged — nothing changed, input is clear
-		if cur == prev {
-			return nil
-		}
-
-		// Check for cycling (oscillating state)
-		for _, seen := range recentCaptures {
-			if cur == seen {
-				return ErrClearStalled
-			}
-		}
-
-		recentCaptures = append(recentCaptures, cur)
-		if len(recentCaptures) > 8 {
-			recentCaptures = recentCaptures[1:]
-		}
-
-		prev = cur
-	}
-
-	return fmt.Errorf("convergence clear exceeded %d iterations", nudgeMaxClearIterations)
-}
-
-// probeInputEmpty sends a single C-a + Ctrl-K probe and returns true if nothing was deleted.
-// This is used to verify that a nudge was submitted (input field is empty after Enter).
-func (t *Tmux) probeInputEmpty(session string, captureN int) bool {
-	prev, err := t.capturePaneLast(session, captureN)
-	if err != nil {
-		return false
-	}
-
-	// Send C-a + Ctrl-K
-	_ = t.SendKeysRaw(session, "C-a")
-	_ = t.SendKeysRaw(session, "C-k")
 	time.Sleep(nudgeClearDelayMs * time.Millisecond)
 
-	cur, err := t.capturePaneLast(session, captureN)
-	if err != nil {
-		return false
-	}
-
-	// If nothing changed, the input was empty → nudge was submitted
-	return cur == prev
+	return beforeCapture, sentinel, captureN, nil
 }
 
 // IsPaneInCopyMode checks if the pane is in copy mode or another blocking mode.
@@ -198,11 +119,6 @@ func (t *Tmux) detectPastePlaceholder(session string) bool {
 		return false
 	}
 	return pastedTextPlaceholderRe.MatchString(content)
-}
-
-// capturePaneLast captures the last N lines of a pane as a single string.
-func (t *Tmux) capturePaneLast(session string, n int) (string, error) {
-	return t.CapturePane(session, n)
 }
 
 // extractOriginalInput extracts the user's original input from the diff between
