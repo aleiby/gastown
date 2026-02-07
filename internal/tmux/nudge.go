@@ -1,8 +1,6 @@
 package tmux
 
 import (
-	"crypto/sha256"
-	"encoding/base32"
 	"errors"
 	"fmt"
 	"regexp"
@@ -17,7 +15,7 @@ var (
 	ErrNudgeDeliveryFailed = errors.New("nudge delivery failed after retries")
 )
 
-// Timing constants for the Clear/Inject/Verify/Restore protocol.
+// Timing constants for the Clear/Inject/Restore protocol.
 const (
 	// nudgeClearDelayMs is the time to wait after Ctrl-U for clear to take effect.
 	nudgeClearDelayMs = 50
@@ -28,9 +26,6 @@ const (
 	// nudgeEnterDelayMs is the time to wait after pressing Enter for submission.
 	nudgeEnterDelayMs = 200
 
-	// nudgeSentinelDelayMs is the time to wait after inserting sentinel.
-	nudgeSentinelDelayMs = 50
-
 	// nudgePastePlaceholderLines is how many lines to scan for paste placeholder.
 	nudgePastePlaceholderLines = 50
 )
@@ -38,73 +33,6 @@ const (
 // pastedTextPlaceholderRe matches Claude Code's large paste placeholder pattern.
 // Example: "[Pasted text #3 +47 lines]"
 var pastedTextPlaceholderRe = regexp.MustCompile(`\[Pasted text #\d+ \+\d+ lines\]`)
-
-// makeSentinel generates a unique sentinel string like "§XXXX§".
-// Uses sha256 of current nanosecond time + base32, 6 chars.
-func makeSentinel() string {
-	h := sha256.Sum256([]byte(fmt.Sprintf("%d", time.Now().UnixNano())))
-	encoded := base32.StdEncoding.EncodeToString(h[:])
-	return "§" + encoded[:6] + "§"
-}
-
-// findSentinelFromEnd searches backward through lines for the sentinel.
-// Returns the line index (from start), lines from bottom, and whether found.
-func findSentinelFromEnd(lines []string, sentinel string) (lineIdx int, linesFromBottom int, found bool) {
-	for i := len(lines) - 1; i >= 0; i-- {
-		if strings.Contains(lines[i], sentinel) {
-			return i, len(lines) - 1 - i, true
-		}
-	}
-	return 0, 0, false
-}
-
-// clearInput implements the sentinel + capture + convergence clear protocol.
-//
-// Steps:
-// 1. Insert sentinel character into input field (C-a positions cursor at start)
-// 2. Capture full pane to find sentinel and determine input line count (N)
-// 3. Run convergence clear loop (C-a + Ctrl-K until stable)
-// 4. Return the BEFORE capture, sentinel, and N for later diff/restore
-func (t *Tmux) clearInput(session string) (beforeCapture string, sentinel string, captureN int, err error) {
-	sentinel = makeSentinel()
-
-	// Move to start of input and insert sentinel
-	if err := t.SendKeysRaw(session, "C-a"); err != nil {
-		return "", "", 0, fmt.Errorf("send C-a: %w", err)
-	}
-	if err := t.SendKeysLiteral(session, sentinel); err != nil {
-		return "", "", 0, fmt.Errorf("send sentinel: %w", err)
-	}
-	time.Sleep(nudgeSentinelDelayMs * time.Millisecond)
-
-	// Capture full pane to find sentinel
-	capture, err := t.CapturePaneAll(session)
-	if err != nil {
-		return "", "", 0, fmt.Errorf("capture after sentinel: %w", err)
-	}
-	beforeCapture = capture
-
-	// Find sentinel in capture
-	lines := strings.Split(capture, "\n")
-	_, linesFromBottom, found := findSentinelFromEnd(lines, sentinel)
-	if !found {
-		// Sentinel not visible — clear what we can and bail
-		_ = t.SendKeysRaw(session, "C-u")
-		return beforeCapture, sentinel, 2, fmt.Errorf("sentinel not found in capture")
-	}
-
-	// N = lines from bottom where sentinel was found
-	// Capture N+2 lines for the convergence loop (extra margin)
-	captureN = linesFromBottom + 2
-
-	// Clear the input with Ctrl-U (clears entire input line in Claude Code TUI)
-	if err := t.SendKeysRaw(session, "C-u"); err != nil {
-		return beforeCapture, sentinel, captureN, fmt.Errorf("send C-u: %w", err)
-	}
-	time.Sleep(nudgeClearDelayMs * time.Millisecond)
-
-	return beforeCapture, sentinel, captureN, nil
-}
 
 // IsPaneInCopyMode checks if the pane is in copy mode or another blocking mode.
 func (t *Tmux) IsPaneInCopyMode(session string) bool {
@@ -121,25 +49,21 @@ func (t *Tmux) detectPastePlaceholder(session string) bool {
 	return pastedTextPlaceholderRe.MatchString(content)
 }
 
-// extractOriginalInput extracts the user's original input from the diff between
-// BEFORE (with sentinel) and AFTER (cleared) captures.
-//
-// Looks for DELETE hunks near the sentinel, strips the sentinel itself and
-// TUI prompt prefixes ("❯ " on first line, "  " on continuation lines).
-func extractOriginalInput(beforeCapture, afterCapture, sentinel string) string {
+// extractDeletedInput finds the last DELETE hunk in the diff between BEFORE
+// and AFTER captures. This represents the input that was cleared by Ctrl-U.
+// Strips TUI prompt prefixes ("❯ " on first line, "  " on continuation lines).
+func extractDeletedInput(beforeCapture, afterCapture string) string {
 	diffs := MyersDiff([]byte(beforeCapture), []byte(afterCapture))
 	hunks := GroupHunks(diffs)
 
-	// Find the hunk that contains the sentinel — that's the input region
+	// The last DELETE hunk is the input that was cleared (closest to bottom of pane)
 	for i := len(hunks) - 1; i >= 0; i-- {
 		h := hunks[i]
-		deleted := string(h.Deleted)
-		if !strings.Contains(deleted, sentinel) {
+		if len(h.Deleted) == 0 {
 			continue
 		}
 
-		// Remove sentinel
-		deleted = strings.ReplaceAll(deleted, sentinel, "")
+		deleted := string(h.Deleted)
 
 		// Strip TUI prompt prefixes line by line
 		lines := strings.Split(deleted, "\n")
@@ -157,20 +81,22 @@ func extractOriginalInput(beforeCapture, afterCapture, sentinel string) string {
 
 		result := strings.Join(cleaned, "\n")
 		result = strings.TrimSpace(result)
-		return result
+		if result != "" {
+			return result
+		}
 	}
 
 	return ""
 }
 
-// nudgeWithProtocol implements the full Clear/Inject/Verify/Restore protocol.
+// nudgeWithProtocol implements the Clear/Inject/Restore protocol.
 //
 // Protocol flow:
 // 1. PRE-CHECKS: Copy mode? Paste placeholder?
-// 2. SENTINEL + CAPTURE BEFORE: Insert sentinel, full capture, find sentinel, determine N
-// 3. CLEAR (convergence): C-a + Ctrl-K until stable
-// 4. CAPTURE AFTER + DIFF: Extract original input
-// 5. INJECT + VERIFY (up to 3 attempts): send-keys + Enter, verify via convergence probe
+// 2. CAPTURE BEFORE: Full pane capture
+// 3. CLEAR: Ctrl-U to clear input
+// 4. CAPTURE AFTER + DIFF: Extract original input from deleted content
+// 5. INJECT: send-keys -l message + Enter
 // 6. RESTORE: Restore original input
 func (t *Tmux) nudgeWithProtocol(session, message string) error {
 	// Pre-checks
@@ -181,18 +107,24 @@ func (t *Tmux) nudgeWithProtocol(session, message string) error {
 		return ErrPasteDetected
 	}
 
-	// Clear input, get BEFORE capture
-	beforeCapture, sentinel, _, err := t.clearInput(session)
+	// Capture BEFORE state
+	beforeCapture, err := t.CapturePaneAll(session)
 	if err != nil {
-		return fmt.Errorf("nudge: %w", err)
+		return fmt.Errorf("nudge: capture before: %w", err)
 	}
 
-	// AFTER capture + diff to extract original input
+	// Clear input with Ctrl-U
+	if err := t.SendKeysRaw(session, "C-u"); err != nil {
+		return fmt.Errorf("nudge: clear: %w", err)
+	}
+	time.Sleep(nudgeClearDelayMs * time.Millisecond)
+
+	// Capture AFTER state and diff to extract original input
 	afterCapture, err := t.CapturePaneAll(session)
 	if err != nil {
-		return fmt.Errorf("nudge: capture after clear: %w", err)
+		return fmt.Errorf("nudge: capture after: %w", err)
 	}
-	originalInput := extractOriginalInput(beforeCapture, afterCapture, sentinel)
+	originalInput := extractDeletedInput(beforeCapture, afterCapture)
 
 	// Inject nudge + Enter
 	if err := t.SendKeysLiteral(session, message); err != nil {
