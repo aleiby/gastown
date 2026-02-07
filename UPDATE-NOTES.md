@@ -24,6 +24,8 @@ upstream/main: 13461161 (v0.5.0+214)
 | #1200 | dc0664d9 | feat(doctor): distinguish fixed vs unfixed in --fix output |
 | #1200 | b5cbeb00 | fix(doctor): show wrench icon for fixed items in streaming output |
 | #1203 | 0b19d1d4 | fix(await-signal): handle empty stdout when querying agent bead |
+| local | 81a86fdd | feat(nudge): replace blind send-keys with C-a+Ctrl-K clear/inject protocol |
+| local | 66d574f9 | fix(nudge): absorb small equals in GroupHunks, add unit tests |
 
 ## Build from Source (Linux)
 
