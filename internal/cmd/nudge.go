@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -160,7 +161,7 @@ func runNudge(cmd *cobra.Command, args []string) error {
 		}
 
 		if err := t.NudgeSession(deaconSession, message); err != nil {
-			return fmt.Errorf("nudging deacon: %w", err)
+			return formatNudgeError(err, "nudging deacon")
 		}
 
 		fmt.Printf("%s Nudged deacon\n", style.Bold.Render("✓"))
@@ -206,7 +207,7 @@ func runNudge(cmd *cobra.Command, args []string) error {
 
 		// Send nudge using the reliable NudgeSession
 		if err := t.NudgeSession(sessionName, message); err != nil {
-			return fmt.Errorf("nudging session: %w", err)
+			return formatNudgeError(err, "nudging session")
 		}
 
 		fmt.Printf("%s Nudged %s/%s\n", style.Bold.Render("✓"), rigName, polecatName)
@@ -227,7 +228,7 @@ func runNudge(cmd *cobra.Command, args []string) error {
 		}
 
 		if err := t.NudgeSession(target, message); err != nil {
-			return fmt.Errorf("nudging session: %w", err)
+			return formatNudgeError(err, "nudging session")
 		}
 
 		fmt.Printf("✓ Nudged %s\n", target)
@@ -500,5 +501,19 @@ func addressToAgentBeadID(address string) string {
 			return fmt.Sprintf("gt-%s-crew-%s", rig, crewName)
 		}
 		return fmt.Sprintf("gt-%s-polecat-%s", rig, role)
+	}
+}
+
+// formatNudgeError translates nudge delivery errors into actionable user messages.
+func formatNudgeError(err error, context string) error {
+	switch {
+	case errors.Is(err, tmux.ErrPaneBlocked):
+		return fmt.Errorf("%s: target is in copy mode. Try again shortly, or use `gt mail send`", context)
+	case errors.Is(err, tmux.ErrPasteDetected):
+		return fmt.Errorf("%s: target has a large paste in progress. Try again shortly, or use `gt mail send`", context)
+	case errors.Is(err, tmux.ErrNudgeDeliveryFailed):
+		return fmt.Errorf("%s: nudge delivery failed. Original input was restored. Use `gt mail send` for guaranteed delivery", context)
+	default:
+		return fmt.Errorf("%s: %w", context, err)
 	}
 }
