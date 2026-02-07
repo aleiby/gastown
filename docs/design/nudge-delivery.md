@@ -243,13 +243,47 @@ Myers diff operates on the raw byte stream of the captures. This means:
 - **Multi-line input** is captured as a contiguous deleted block
 - **TUI formatting** (prompt characters, indentation) is included in the deleted content
 
-The TUI formatting prefix needs to be stripped from the deleted content to recover the raw user input. This is the one format-dependent operation — but it only needs to handle the prefix of each line (prompt `>`, indentation), not parse the full TUI output. The sentinel position helps identify which deleted lines are input vs. other changes.
+The TUI formatting prefix needs to be stripped from the deleted content to recover the raw user input. This is the one format-dependent operation — but it only needs to handle the prefix of each line (prompt `❯ ` on the first line, `  ` two-space indent on continuation lines), not parse the full TUI output. The sentinel position helps identify which deleted lines are input vs. other changes.
+
+### Validated: Byte-Level Myers Diff Works
+
+Tested against real Claude Code captures (amos session). The byte-level Myers diff correctly identifies all deleted input content, including:
+
+- **Empty lines**: Preserved as part of the deleted region (not matched against trailing padding). This is because surrounding bytes anchor each empty line in its byte position.
+- **Multi-line content**: All lines appear in DELETE hunks near the sentinel position.
+- **Sentinel**: Appears in the deleted content, easy to strip.
+
+**Observed diff structure** (5-line input with empty lines):
+```
+EQUAL: 1378 bytes          ← identical scrollback history (common prefix)
+DELETE: 15 bytes (1 line)  ← "Line 1 of input"
+EQUAL: 1 byte              ← newline after prompt prefix "❯ "
+DELETE: 65 bytes (5 lines) ← "\n  Line 3 after...\n\n  §sentinel§Line 5...\n"
+EQUAL: 428 bytes           ← separator + status bar (unchanged portion)
+[small noise hunks]        ← status bar tooltip text changed
+EQUAL: 30 bytes            ← trailing common suffix
+```
+
+**Key observations:**
+1. Full capture vs. last-N-lines gives identical diff results — the common prefix/suffix optimization handles the scrollback naturally.
+2. The first content line splits into its own DELETE hunk because the 1-byte `\n` between `❯ ` and content matches in both captures. This is easily handled by collecting adjacent DELETE hunks.
+3. Status bar tooltip changes create small noise hunks (e.g., `ctrl+g to edit in VS Code` → `ctrl+t to hide tasks`). These are distant from the input area and can be filtered by position or by the existing `minEqualToBreakHunk` logic.
+4. No agent output appeared during the ~500ms clearing window in tests, but the diff structure would isolate it as INSERT hunks above the input region.
+
+### Input Extraction Algorithm
+
+Given the diff results, extracting the original input:
+
+1. Find DELETE hunks containing the sentinel string
+2. Collect adjacent DELETE hunks (separated by small EQUAL sections < `minEqualToBreakHunk`)
+3. Strip sentinel from the collected content
+4. Strip TUI prefix from each line: `❯ ` (first line) or `  ` (continuation lines)
+5. The result is the raw user input with original formatting preserved
 
 ### Open Questions
 
-- **How reliably does Myers diff isolate the input?** Needs testing with real before/after captures from the C-a+Ctrl-K clearing process to verify clean hunk boundaries.
-- **TUI prefix stripping**: How much formatting does the TUI add to input lines? Is it consistent enough to strip mechanically, or does it vary by line position?
-- **Agent output during clearing**: If the agent produces output during the ~1s clearing window, it appears as inserted content in the diff. Does this interfere with identifying the deleted input?
+- **Agent output during clearing**: If the agent produces output during the ~1s clearing window, it appears as INSERT hunks in the diff. Tested cases showed no interference, but a slow-responding agent or busy session could produce output. The diff structure would isolate it as INSERT content above the input region.
+- **Vim mode detection**: Ctrl-K is a digraph key in vim insert mode. Need to detect vim mode and use an alternate clearing strategy (future).
 
 ## Edge Cases
 
