@@ -264,7 +264,18 @@ func mergeOps(ops []Diff) []Diff {
 }
 
 // GroupHunks groups consecutive Delete/Insert operations into Hunks.
-// Equal operations separate hunks.
+// Small Equal sections (< minEqualToBreakHunk bytes) are absorbed into the
+// current hunk rather than breaking it. This prevents fragmentation from
+// spurious character-level matches in Myers diff output.
+//
+// For example, multi-line input often produces:
+//
+//	DELETE: "Line 1 of input"
+//	EQUAL:  "\n"              (1 byte — absorbed, does NOT break the hunk)
+//	DELETE: "Line 2 of input"
+//
+// Without absorption, this would produce two separate hunks and
+// extractOriginalInput would only find the hunk containing the sentinel.
 func GroupHunks(diffs []Diff) []Hunk {
 	var hunks []Hunk
 	var current Hunk
@@ -273,7 +284,12 @@ func GroupHunks(diffs []Diff) []Hunk {
 	for _, d := range diffs {
 		switch d.Op {
 		case DiffEqual:
-			if inHunk {
+			if inHunk && len(d.Data) < minEqualToBreakHunk {
+				// Small Equal — absorb into both sides of the current hunk
+				current.Deleted = append(current.Deleted, d.Data...)
+				current.Inserted = append(current.Inserted, d.Data...)
+			} else if inHunk {
+				// Significant Equal — close the current hunk
 				hunks = append(hunks, current)
 				current = Hunk{}
 				inHunk = false
