@@ -24,6 +24,7 @@ upstream/main: 13461161 (v0.5.0+214)
 | #1200 | dc0664d9 | feat(doctor): distinguish fixed vs unfixed in --fix output |
 | #1200 | b5cbeb00 | fix(doctor): show wrench icon for fixed items in streaming output |
 | #1203 | 0b19d1d4 | fix(await-signal): handle empty stdout when querying agent bead |
+| local | 2543917a | feat(nudge): replace blind send-keys with SYPHN protocol |
 
 ## Build from Source (Linux)
 
@@ -33,12 +34,8 @@ Building requires CGO and these system dependencies:
 # Debian/Ubuntu
 sudo apt-get install -y gcc g++ libzstd-dev libicu-dev
 
-# Build and install (ldflags required for version info and BuiltProperly check)
-VERSION=$(git describe --tags --always --dirty | sed 's/^v//') && \
-COMMIT=$(git rev-parse --short HEAD) && \
-BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ") && \
-go generate ./... && \
-go install -ldflags "-X github.com/steveyegge/gastown/internal/cmd.Version=$VERSION -X github.com/steveyegge/gastown/internal/cmd.Commit=$COMMIT -X github.com/steveyegge/gastown/internal/cmd.BuildTime=$BUILD_TIME -X github.com/steveyegge/gastown/internal/cmd.BuiltProperly=1" ./cmd/gt
+# Build and install (uses Makefile for ldflags and BuiltProperly check)
+make install
 ```
 
 ### Pre-Build Checklist
