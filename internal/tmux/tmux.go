@@ -7,11 +7,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/config"
@@ -640,6 +640,20 @@ func (t *Tmux) SendKeysRaw(session, keys string) error {
 	return err
 }
 
+// SendKeysLiteral sends text to a session in literal mode without Enter.
+// Literal mode (-l) treats all characters as literal text, not key names.
+// Use this for injecting text that may contain special characters.
+//
+// Escapes trailing semicolons which tmux's command parser would otherwise
+// consume as command separators (even when passed via exec.Command argv).
+func (t *Tmux) SendKeysLiteral(session, text string) error {
+	if strings.HasSuffix(text, ";") {
+		text = text[:len(text)-1] + `\;`
+	}
+	_, err := t.run("send-keys", "-t", session, "-l", text)
+	return err
+}
+
 // SendKeysReplace sends keystrokes, clearing any pending input first.
 // This is useful for "replaceable" notifications where only the latest matters.
 // Uses Ctrl-U to clear the input line before sending the new message.
@@ -685,6 +699,27 @@ func getSessionNudgeLock(session string) *sync.Mutex {
 	return actual.(*sync.Mutex)
 }
 
+// acquireNudgeFileLock acquires a cross-process file lock for nudging a session.
+// Returns the lock file (caller must close it to release) or an error.
+// This serializes nudges from separate gt processes targeting the same session.
+func acquireNudgeFileLock(session string) (*os.File, error) {
+	// Sanitize session name for filename safety
+	safe := strings.NewReplacer("/", "-", "%", "pct").Replace(session)
+	path := fmt.Sprintf("/tmp/gt-nudge-%s.lock", safe)
+
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("open nudge lock %s: %w", path, err)
+	}
+
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("flock nudge lock %s: %w", path, err)
+	}
+
+	return f, nil
+}
+
 // IsSessionAttached returns true if the session has any clients attached.
 func (t *Tmux) IsSessionAttached(target string) bool {
 	attached, err := t.run("display-message", "-t", target, "-p", "#{session_attached}")
@@ -720,88 +755,58 @@ func (t *Tmux) WakePaneIfDetached(target string) {
 
 // NudgeSession sends a message to a Claude Code session reliably.
 // This is the canonical way to send messages to Claude sessions.
-// Uses: literal mode + 500ms debounce + ESC (for vim mode) + separate Enter.
-// After sending, triggers SIGWINCH to wake Claude in detached sessions.
 // Verification is the Witness's job (AI), not this function.
+//
+// Uses the SYPHN protocol (Sentinel, Yank, Push, Heal, Nudge):
+//   S — Sentinel: insert sentinel to locate cursor, capture BEFORE state
+//   Y — Yank: clear input via convergence loop, diff to extract original input
+//   P — Push: inject nudge text + Enter
+//   H — Heal: restore original input if any
+//   N — Nudge: wake pane (SIGWINCH) for detached sessions
+//
+// This preserves user input when nudges arrive while the user is typing.
 //
 // IMPORTANT: Nudges to the same session are serialized to prevent interleaving.
 // If multiple goroutines try to nudge the same session concurrently, they will
 // queue up and execute one at a time. This prevents garbled input when
 // SessionStart hooks and nudges arrive simultaneously.
 func (t *Tmux) NudgeSession(session, message string) error {
-	// Serialize nudges to this session to prevent interleaving
+	// Cross-process lock: serialize nudges from different gt processes
+	flock, err := acquireNudgeFileLock(session)
+	if err != nil {
+		return fmt.Errorf("nudge lock: %w", err)
+	}
+	defer flock.Close()
+
+	// In-process lock: serialize nudges from goroutines in same process
 	lock := getSessionNudgeLock(session)
 	lock.Lock()
 	defer lock.Unlock()
 
-	// 1. Send text in literal mode (handles special characters)
-	if _, err := t.run("send-keys", "-t", session, "-l", message); err != nil {
-		return err
-	}
-
-	// 2. Wait 500ms for paste to complete (tested, required)
-	time.Sleep(500 * time.Millisecond)
-
-	// 3. Send Escape to exit vim INSERT mode if enabled (harmless in normal mode)
-	// See: https://github.com/anthropics/gastown/issues/307
-	_, _ = t.run("send-keys", "-t", session, "Escape")
-	time.Sleep(100 * time.Millisecond)
-
-	// 4. Send Enter with retry (critical for message submission)
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 {
-			time.Sleep(200 * time.Millisecond)
-		}
-		if _, err := t.run("send-keys", "-t", session, "Enter"); err != nil {
-			lastErr = err
-			continue
-		}
-		// 5. Wake the pane to trigger SIGWINCH for detached sessions
-		t.WakePaneIfDetached(session)
-		return nil
-	}
-	return fmt.Errorf("failed to send Enter after 3 attempts: %w", lastErr)
+	return t.nudgeWithProtocol(session, message)
 }
 
 // NudgePane sends a message to a specific pane reliably.
 // Same pattern as NudgeSession but targets a pane ID (e.g., "%9") instead of session name.
+// Uses the SYPHN protocol to preserve user input.
 // After sending, triggers SIGWINCH to wake Claude in detached sessions.
 // Nudges to the same pane are serialized to prevent interleaving.
 func (t *Tmux) NudgePane(pane, message string) error {
-	// Serialize nudges to this pane to prevent interleaving
+	// Cross-process lock: serialize nudges from different gt processes
+	flock, err := acquireNudgeFileLock(pane)
+	if err != nil {
+		return fmt.Errorf("nudge lock: %w", err)
+	}
+	defer flock.Close()
+
+	// In-process lock: serialize nudges from goroutines in same process
 	lock := getSessionNudgeLock(pane)
 	lock.Lock()
 	defer lock.Unlock()
 
-	// 1. Send text in literal mode (handles special characters)
-	if _, err := t.run("send-keys", "-t", pane, "-l", message); err != nil {
-		return err
-	}
-
-	// 2. Wait 500ms for paste to complete (tested, required)
-	time.Sleep(500 * time.Millisecond)
-
-	// 3. Send Escape to exit vim INSERT mode if enabled (harmless in normal mode)
-	// See: https://github.com/anthropics/gastown/issues/307
-	_, _ = t.run("send-keys", "-t", pane, "Escape")
-	time.Sleep(100 * time.Millisecond)
-
-	// 4. Send Enter with retry (critical for message submission)
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 {
-			time.Sleep(200 * time.Millisecond)
-		}
-		if _, err := t.run("send-keys", "-t", pane, "Enter"); err != nil {
-			lastErr = err
-			continue
-		}
-		// 5. Wake the pane to trigger SIGWINCH for detached sessions
-		t.WakePaneIfDetached(pane)
-		return nil
-	}
-	return fmt.Errorf("failed to send Enter after 3 attempts: %w", lastErr)
+	// Use the same reliable protocol as NudgeSession
+	// (pane IDs work with tmux commands just like session names)
+	return t.nudgeWithProtocol(pane, message)
 }
 
 // AcceptBypassPermissionsWarning dismisses the Claude Code bypass permissions warning dialog.
@@ -884,32 +889,6 @@ func (t *Tmux) GetPanePID(session string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(out), nil
-}
-
-// processMatchesNames checks if a process's binary name matches any of the given names.
-// Uses ps to get the actual command name from the process's executable path.
-// This handles cases where argv[0] is modified (e.g., Claude showing version "2.1.30").
-func processMatchesNames(pid string, names []string) bool {
-	if len(names) == 0 {
-		return false
-	}
-	// Use ps to get the command name (COMM column gives the executable name)
-	cmd := exec.Command("ps", "-p", pid, "-o", "comm=")
-	out, err := cmd.Output()
-	if err != nil {
-		return false
-	}
-	// Get just the base name (in case it's a full path like /Users/.../claude)
-	commPath := strings.TrimSpace(string(out))
-	comm := filepath.Base(commPath)
-
-	// Check if any name matches
-	for _, name := range names {
-		if comm == name {
-			return true
-		}
-	}
-	return false
 }
 
 // hasDescendantWithNames checks if a process has any descendant (child, grandchild, etc.)
@@ -1003,9 +982,32 @@ func (t *Tmux) CapturePane(session string, lines int) (string, error) {
 	return t.run("capture-pane", "-p", "-t", session, "-S", fmt.Sprintf("-%d", lines))
 }
 
-// CapturePaneAll captures all scrollback history.
-func (t *Tmux) CapturePaneAll(session string) (string, error) {
-	return t.run("capture-pane", "-p", "-t", session, "-S", "-")
+// CapturePaneAll captures pane content with -J (join wrapped lines), so
+// the output reflects logical lines rather than visual rows. This is
+// critical for the nudge diff protocol: without -J, long lines that wrap
+// visually appear as multiple lines, injecting spurious newlines into the
+// extracted input.
+//
+// If lines is 0, captures all scrollback history. If lines > 0, captures
+// only the last N lines.
+//
+// The -J flag also preserves trailing whitespace on each line. We strip
+// this per-line to keep diff output clean (trailing spaces create noise
+// that fragments hunks and breaks input extraction).
+func (t *Tmux) CapturePaneAll(session string, lines int) (string, error) {
+	startFlag := "-"
+	if lines > 0 {
+		startFlag = fmt.Sprintf("-%d", lines)
+	}
+	out, err := t.run("capture-pane", "-p", "-J", "-t", session, "-S", startFlag)
+	if err != nil {
+		return "", err
+	}
+	parts := strings.Split(out, "\n")
+	for i, line := range parts {
+		parts[i] = strings.TrimRight(line, " ")
+	}
+	return strings.Join(parts, "\n"), nil
 }
 
 // CapturePaneLines captures the last N lines of a pane as a slice.
@@ -1188,12 +1190,7 @@ func (t *Tmux) IsRuntimeRunning(session string, processNames []string) bool {
 		}
 	}
 	// If pane command is unrecognized (not in processNames, not a shell),
-	// check if the process ITSELF matches (handles version-as-argv[0] like "2.1.30")
-	// before checking descendants.
-	if processMatchesNames(pid, processNames) {
-		return true
-	}
-	// Finally check descendants as fallback
+	// still check descendants as fallback. This handles version-as-argv[0].
 	return hasDescendantWithNames(pid, processNames, 0)
 }
 
@@ -1318,7 +1315,7 @@ func (t *Tmux) WaitForRuntimeReady(session string, rc *config.RuntimeConfig, tim
 
 // GetSessionInfo returns detailed information about a session.
 func (t *Tmux) GetSessionInfo(name string) (*SessionInfo, error) {
-	format := "#{session_name}|#{session_windows}|#{session_created}|#{session_attached}|#{session_activity}|#{session_last_attached}"
+	format := "#{session_name}|#{session_windows}|#{session_created_string}|#{session_attached}|#{session_activity}|#{session_last_attached}"
 	out, err := t.run("list-sessions", "-F", format, "-f", fmt.Sprintf("#{==:#{session_name},%s}", name))
 	if err != nil {
 		return nil, err
@@ -1335,17 +1332,10 @@ func (t *Tmux) GetSessionInfo(name string) (*SessionInfo, error) {
 	windows := 0
 	_, _ = fmt.Sscanf(parts[1], "%d", &windows) // non-fatal: defaults to 0 on parse error
 
-	// Convert unix timestamp to formatted string for consumers.
-	created := parts[2]
-	var createdUnix int64
-	if _, err := fmt.Sscanf(created, "%d", &createdUnix); err == nil && createdUnix > 0 {
-		created = time.Unix(createdUnix, 0).Format("2006-01-02 15:04:05")
-	}
-
 	info := &SessionInfo{
 		Name:     parts[0],
 		Windows:  windows,
-		Created:  created,
+		Created:  parts[2],
 		Attached: parts[3] == "1",
 	}
 
